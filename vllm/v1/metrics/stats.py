@@ -183,6 +183,18 @@ class SchedulerIterationDetails:
 
 
 @dataclass
+class StrictPriorityPreemptionStats:
+    """Stats for strict-priority preemption since the previous update."""
+
+    num_preemptions: int = 0
+    num_kv_retains: int = 0
+    num_recomputes: int = 0
+    num_retained_reqs: int = 0
+    pause_durations_ms: list[float] = field(default_factory=list)
+    resume_latencies_ms: list[float] = field(default_factory=list)
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -212,6 +224,8 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    strict_priority_preemption_stats: StrictPriorityPreemptionStats | None = None
 
 
 @dataclass

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import statistics
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -27,6 +28,7 @@ from vllm.v1.metrics.stats import (
     MultiModalCacheStats,
     PromptTokenStats,
     SchedulerStats,
+    StrictPriorityPreemptionStats,
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 from vllm.v1.spec_decode.metrics import SpecDecodingLogging, SpecDecodingProm
@@ -127,6 +129,11 @@ class LoggingStatLogger(StatLoggerBase):
         self.last_generation_throughput: float = 0.0
         self.engine_is_idle = False
         self.aggregated = False
+        self.last_num_strict_priority_preemptions = 0
+        self.last_num_strict_priority_kv_retains = 0
+        self.last_num_strict_priority_recomputes = 0
+        self.last_strict_priority_pause_durations_ms: list[float] = []
+        self.last_strict_priority_resume_latencies_ms: list[float] = []
 
         if self._enable_perf_stats():
             self.perf_metrics_logging = PerfMetricsLogging(vllm_config)
@@ -139,6 +146,11 @@ class LoggingStatLogger(StatLoggerBase):
         self.num_generation_tokens: int = 0
         self.num_corrupted_reqs: int = 0
         self.num_preemptions: int = 0
+        self.num_strict_priority_preemptions: int = 0
+        self.num_strict_priority_kv_retains: int = 0
+        self.num_strict_priority_recomputes: int = 0
+        self.strict_priority_pause_durations_ms: list[float] = []
+        self.strict_priority_resume_latencies_ms: list[float] = []
 
     def _enable_perf_stats(self) -> bool:
         return self.vllm_config.observability_config.enable_mfu_metrics
@@ -214,6 +226,17 @@ class LoggingStatLogger(StatLoggerBase):
             self._log_iteration_details(scheduler_stats, engine_idx)
             self.prefix_caching_metrics.observe(scheduler_stats.prefix_cache_stats)
 
+            if strict_stats := scheduler_stats.strict_priority_preemption_stats:
+                self.num_strict_priority_preemptions += strict_stats.num_preemptions
+                self.num_strict_priority_kv_retains += strict_stats.num_kv_retains
+                self.num_strict_priority_recomputes += strict_stats.num_recomputes
+                self.strict_priority_pause_durations_ms.extend(
+                    strict_stats.pause_durations_ms
+                )
+                self.strict_priority_resume_latencies_ms.extend(
+                    strict_stats.resume_latencies_ms
+                )
+
             if scheduler_stats.connector_prefix_cache_stats is not None:
                 self.connector_prefix_caching_metrics.observe(
                     scheduler_stats.connector_prefix_cache_stats
@@ -239,6 +262,16 @@ class LoggingStatLogger(StatLoggerBase):
         now = time.monotonic()
         prompt_throughput = self._get_throughput(self.num_prompt_tokens, now)
         generation_throughput = self._get_throughput(self.num_generation_tokens, now)
+
+        self.last_num_strict_priority_preemptions = self.num_strict_priority_preemptions
+        self.last_num_strict_priority_kv_retains = self.num_strict_priority_kv_retains
+        self.last_num_strict_priority_recomputes = self.num_strict_priority_recomputes
+        self.last_strict_priority_pause_durations_ms = (
+            self.strict_priority_pause_durations_ms
+        )
+        self.last_strict_priority_resume_latencies_ms = (
+            self.strict_priority_resume_latencies_ms
+        )
 
         self._reset(now)
         self.engine_is_idle = not any(
@@ -286,6 +319,38 @@ class LoggingStatLogger(StatLoggerBase):
         if self.num_preemptions > 0:
             log_parts.append("Preemptions: %d")
             log_args.append(self.num_preemptions)
+
+        if self.vllm_config.scheduler_config.enable_strict_priority_preemption:
+            strict_stats = self.last_scheduler_stats.strict_priority_preemption_stats
+            num_retained_reqs = (
+                strict_stats.num_retained_reqs if strict_stats is not None else 0
+            )
+            log_parts.extend(
+                [
+                    "Strict priority preemptions: %d",
+                    "GPU KV retains: %d",
+                    "KV recomputes: %d",
+                    "Retained: %d reqs",
+                ]
+            )
+            log_args.extend(
+                [
+                    self.last_num_strict_priority_preemptions,
+                    self.last_num_strict_priority_kv_retains,
+                    self.last_num_strict_priority_recomputes,
+                    num_retained_reqs,
+                ]
+            )
+            if self.last_strict_priority_pause_durations_ms:
+                log_parts.append("Pause P50: %.2f ms")
+                log_args.append(
+                    statistics.median(self.last_strict_priority_pause_durations_ms)
+                )
+            if self.last_strict_priority_resume_latencies_ms:
+                log_parts.append("Resume latency P50: %.2f ms")
+                log_args.append(
+                    statistics.median(self.last_strict_priority_resume_latencies_ms)
+                )
 
         log_parts.extend(
             [
@@ -377,6 +442,8 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
 
     def aggregate_scheduler_stats(self):
         self.last_scheduler_stats = SchedulerStats()
+        strict_priority_stats = StrictPriorityPreemptionStats()
+        has_strict_priority_stats = False
         for last_scheduler_stats in self.last_scheduler_stats_dict.values():
             self.last_scheduler_stats.num_waiting_reqs += (
                 last_scheduler_stats.num_waiting_reqs
@@ -390,7 +457,19 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
             self.last_scheduler_stats.kv_cache_usage += (
                 last_scheduler_stats.kv_cache_usage
             )
+            if (
+                current_strict_stats
+                := last_scheduler_stats.strict_priority_preemption_stats
+            ) is not None:
+                has_strict_priority_stats = True
+                strict_priority_stats.num_retained_reqs += (
+                    current_strict_stats.num_retained_reqs
+                )
         self.last_scheduler_stats.kv_cache_usage /= len(self.last_scheduler_stats_dict)
+        if has_strict_priority_stats:
+            self.last_scheduler_stats.strict_priority_preemption_stats = (
+                strict_priority_stats
+            )
 
     def log(self):
         LoggingStatLogger.log(self)

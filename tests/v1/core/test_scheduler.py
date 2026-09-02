@@ -2942,6 +2942,12 @@ def test_strict_priority_preemption_retains_kv(use_v2_model_runner):
     assert scheduler.kv_cache_manager.get_block_ids("low") == retained_block_ids
     assert output.preempted_req_ids == {"low"}
     assert "low" in scheduler._retained_preempted_req_ids
+    strict_stats = scheduler.make_stats().strict_priority_preemption_stats
+    assert strict_stats is not None
+    assert strict_stats.num_preemptions == 1
+    assert strict_stats.num_kv_retains == 1
+    assert strict_stats.num_recomputes == 0
+    assert strict_stats.num_retained_reqs == 1
 
     scheduler.update_from_output(output, make_output(scheduler))
     scheduler.finish_requests("high", RequestStatus.FINISHED_STOPPED)
@@ -2960,6 +2966,20 @@ def test_strict_priority_preemption_retains_kv(use_v2_model_runner):
     resumed_block_ids = scheduler.kv_cache_manager.get_block_ids("low")
     for before, after in zip(retained_block_ids, resumed_block_ids):
         assert after[: len(before)] == before
+
+    engine_outputs = scheduler.update_from_output(output, make_output(scheduler))
+    scheduler_stats = next(iter(engine_outputs.values())).scheduler_stats
+    assert scheduler_stats is not None
+    strict_stats = scheduler_stats.strict_priority_preemption_stats
+    assert strict_stats is not None
+    assert strict_stats.num_preemptions == 0
+    assert strict_stats.num_kv_retains == 0
+    assert strict_stats.num_recomputes == 0
+    assert strict_stats.num_retained_reqs == 0
+    assert len(strict_stats.pause_durations_ms) == 1
+    assert strict_stats.pause_durations_ms[0] > 0
+    assert len(strict_stats.resume_latencies_ms) == 1
+    assert strict_stats.resume_latencies_ms[0] > 0
 
 
 def test_strict_priority_preemption_recomputes_when_kv_is_full():
@@ -3001,6 +3021,12 @@ def test_strict_priority_preemption_recomputes_when_kv_is_full():
     assert scheduler.kv_cache_manager.get_block_ids("low") == ([],)
     assert "low" not in scheduler._retained_preempted_req_ids
     assert output.num_scheduled_tokens == {"high": 64}
+    strict_stats = scheduler.make_stats().strict_priority_preemption_stats
+    assert strict_stats is not None
+    assert strict_stats.num_preemptions == 1
+    assert strict_stats.num_kv_retains == 1
+    assert strict_stats.num_recomputes == 1
+    assert strict_stats.num_retained_reqs == 0
 
 
 def test_strict_priority_preemption_allows_same_priority_batching():

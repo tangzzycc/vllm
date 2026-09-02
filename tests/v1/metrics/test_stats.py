@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from unittest.mock import MagicMock, patch
+
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
+from vllm.v1.metrics.loggers import LoggingStatLogger
 from vllm.v1.metrics.stats import (
     IterationStats,
     PrefillStats,
@@ -9,6 +12,7 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerIterationDetails,
     SchedulerStats,
+    StrictPriorityPreemptionStats,
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.utils import compute_iteration_details
@@ -43,6 +47,66 @@ def test_scheduler_iteration_details_serialization():
     assert decoded.scheduler_stats is not None
     assert decoded.scheduler_stats.kv_cache_usage == 0.5
     assert decoded.scheduler_stats.iteration_details == iteration_details
+
+
+def test_strict_priority_preemption_stats_serialization():
+    strict_priority_stats = StrictPriorityPreemptionStats(
+        num_preemptions=2,
+        num_kv_retains=2,
+        num_recomputes=1,
+        num_retained_reqs=1,
+        pause_durations_ms=[10.0, 20.0],
+        resume_latencies_ms=[2.0, 4.0],
+    )
+    outputs = EngineCoreOutputs(
+        scheduler_stats=SchedulerStats(
+            strict_priority_preemption_stats=strict_priority_stats
+        )
+    )
+
+    encoded = MsgpackEncoder().encode(outputs)
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(encoded)
+
+    assert decoded.scheduler_stats is not None
+    assert (
+        decoded.scheduler_stats.strict_priority_preemption_stats
+        == strict_priority_stats
+    )
+
+
+def test_strict_priority_preemption_stats_logging():
+    vllm_config = MagicMock()
+    vllm_config.model_config = None
+    vllm_config.kv_transfer_config = None
+    vllm_config.observability_config.cudagraph_metrics = False
+    vllm_config.observability_config.enable_mfu_metrics = False
+    vllm_config.scheduler_config.enable_strict_priority_preemption = True
+    stat_logger = LoggingStatLogger(vllm_config)
+    stat_logger.record(
+        SchedulerStats(
+            strict_priority_preemption_stats=StrictPriorityPreemptionStats(
+                num_preemptions=2,
+                num_kv_retains=2,
+                num_recomputes=1,
+                num_retained_reqs=1,
+                pause_durations_ms=[10.0, 20.0],
+                resume_latencies_ms=[2.0, 4.0],
+            )
+        ),
+        None,
+    )
+
+    with patch("vllm.v1.metrics.loggers.logger.debug") as log:
+        stat_logger.log()
+
+    fmt, *args = log.call_args.args
+    message = fmt % tuple(args)
+    assert "Strict priority preemptions: 2" in message
+    assert "GPU KV retains: 2" in message
+    assert "KV recomputes: 1" in message
+    assert "Retained: 1 reqs" in message
+    assert "Pause P50: 15.00 ms" in message
+    assert "Resume latency P50: 3.00 ms" in message
 
 
 def test_compute_iteration_details_includes_encoder_stats():

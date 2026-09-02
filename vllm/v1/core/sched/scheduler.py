@@ -55,7 +55,11 @@ from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
-from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+from vllm.v1.metrics.stats import (
+    PrefixCacheStats,
+    SchedulerStats,
+    StrictPriorityPreemptionStats,
+)
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -222,6 +226,13 @@ class Scheduler(SchedulerInterface):
         self.reset_preempted_req_ids: set[str] = set()
         # Preempted requests that still own their GPU KV blocks.
         self._retained_preempted_req_ids: set[str] = set()
+        self._strict_priority_preempted_at: dict[str, float] = {}
+        self._strict_priority_resume_started_at: dict[str, float] = {}
+        self._strict_priority_num_preemptions = 0
+        self._strict_priority_num_kv_retains = 0
+        self._strict_priority_num_recomputes = 0
+        self._strict_priority_pause_durations_ms: list[float] = []
+        self._strict_priority_resume_latencies_ms: list[float] = []
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -1142,6 +1153,14 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                preempted_at = self._strict_priority_preempted_at.pop(request_id, None)
+                if preempted_at is not None:
+                    self._strict_priority_pause_durations_ms.append(
+                        (scheduled_timestamp - preempted_at) * 1000
+                    )
+                    self._strict_priority_resume_started_at[request_id] = (
+                        scheduled_timestamp
+                    )
                 self._retained_preempted_req_ids.discard(request_id)
                 if pad_spec_decode:
                     scheduled_spec_decode_tokens[request_id] = [
@@ -1386,6 +1405,8 @@ class Scheduler(SchedulerInterface):
             candidates,
             key=lambda req: (req.priority, req.arrival_time, req.request_id),
         )
+        if self.log_stats:
+            self._strict_priority_num_recomputes += 1
         self._free_request_blocks(request)
         request.num_computed_tokens = 0
         return True
@@ -1415,6 +1436,10 @@ class Scheduler(SchedulerInterface):
         )
         if retain_kv:
             self._retained_preempted_req_ids.add(request.request_id)
+            if self.log_stats:
+                self._strict_priority_num_preemptions += 1
+                self._strict_priority_num_kv_retains += 1
+                self._strict_priority_preempted_at[request.request_id] = timestamp
         else:
             self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
@@ -1810,6 +1835,18 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+
+        strict_priority_resume_started_at = getattr(
+            self, "_strict_priority_resume_started_at", None
+        )
+        if strict_priority_resume_started_at:
+            completed_at = time.monotonic()
+            for request_id in num_scheduled_tokens:
+                resumed_at = strict_priority_resume_started_at.pop(request_id, None)
+                if resumed_at is not None:
+                    self._strict_priority_resume_latencies_ms.append(
+                        (completed_at - resumed_at) * 1000
+                    )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -2469,6 +2506,8 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        self._strict_priority_preempted_at.pop(request.request_id, None)
+        self._strict_priority_resume_started_at.pop(request.request_id, None)
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 
@@ -2658,6 +2697,21 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        strict_priority_preemption_stats = None
+        if self.enable_strict_priority_preemption:
+            strict_priority_preemption_stats = StrictPriorityPreemptionStats(
+                num_preemptions=self._strict_priority_num_preemptions,
+                num_kv_retains=self._strict_priority_num_kv_retains,
+                num_recomputes=self._strict_priority_num_recomputes,
+                num_retained_reqs=len(self._retained_preempted_req_ids),
+                pause_durations_ms=self._strict_priority_pause_durations_ms,
+                resume_latencies_ms=self._strict_priority_resume_latencies_ms,
+            )
+            self._strict_priority_num_preemptions = 0
+            self._strict_priority_num_kv_retains = 0
+            self._strict_priority_num_recomputes = 0
+            self._strict_priority_pause_durations_ms = []
+            self._strict_priority_resume_latencies_ms = []
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
@@ -2670,6 +2724,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            strict_priority_preemption_stats=strict_priority_preemption_stats,
         )
 
     def make_spec_decoding_stats(
