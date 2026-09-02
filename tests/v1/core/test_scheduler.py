@@ -12,12 +12,14 @@ from vllm.config import (
     CacheConfig,
     ECTransferConfig,
     KVTransferConfig,
+    LoRAConfig,
     ModelConfig,
     SchedulerConfig,
     SpeculativeConfig,
     VllmConfig,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -2443,6 +2445,8 @@ def create_scheduler_with_priority(
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
+    enable_strict_priority_preemption: bool = False,
+    lora_config: LoRAConfig | None = None,
 ) -> Scheduler:
     """Create scheduler with priority policy enabled.
 
@@ -2474,6 +2478,8 @@ def create_scheduler_with_priority(
         enable_chunked_prefill=True,
         is_encoder_decoder=model_config.is_encoder_decoder,
         policy="priority",  # Enable priority scheduling
+        enable_strict_priority_preemption=enable_strict_priority_preemption,
+        async_scheduling=False if enable_strict_priority_preemption else None,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
     )
@@ -2517,6 +2523,7 @@ def create_scheduler_with_priority(
         kv_transfer_config=kv_transfer_config,
         speculative_config=speculative_config,
         ec_transfer_config=ec_transfer_config,
+        lora_config=lora_config,
     )
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
@@ -2892,6 +2899,243 @@ def test_priority_scheduling_no_preemption_when_space_available():
     assert len(output.scheduled_new_reqs) == 1
     assert len(scheduler.running) == 3  # All three requests running
     assert len(scheduler.waiting) == 0  # No requests waiting
+
+
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
+def test_strict_priority_preemption_retains_kv(use_v2_model_runner):
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2,
+        max_num_batched_tokens=200,
+        num_blocks=100,
+        use_v2_model_runner=use_v2_model_runner,
+        enable_strict_priority_preemption=True,
+    )
+    low = create_requests_with_priority(
+        num_requests=1,
+        priorities=[10],
+        arrival_times=[1.0],
+        num_tokens=32,
+        req_ids=["low"],
+    )[0]
+    scheduler.add_request(low)
+
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, make_output(scheduler))
+    retained_num_computed_tokens = low.num_computed_tokens
+    retained_block_ids = scheduler.kv_cache_manager.get_block_ids("low")
+
+    high = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=32,
+        req_ids=["high"],
+    )[0]
+    scheduler.add_request(high)
+
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in scheduler.running] == ["high"]
+    assert low.status == RequestStatus.PREEMPTED
+    assert low in scheduler.waiting
+    assert low.num_computed_tokens == retained_num_computed_tokens
+    assert scheduler.kv_cache_manager.get_block_ids("low") == retained_block_ids
+    assert output.preempted_req_ids == {"low"}
+    assert "low" in scheduler._retained_preempted_req_ids
+
+    scheduler.update_from_output(output, make_output(scheduler))
+    scheduler.finish_requests("high", RequestStatus.FINISHED_STOPPED)
+
+    output = scheduler.schedule()
+
+    assert low.status == RequestStatus.RUNNING
+    assert "low" not in scheduler._retained_preempted_req_ids
+    assert output.num_scheduled_tokens == {"low": 1}
+    resumed_num_computed_tokens = (
+        output.scheduled_new_reqs[0].num_computed_tokens
+        if use_v2_model_runner
+        else output.scheduled_cached_reqs.num_computed_tokens[0]
+    )
+    assert resumed_num_computed_tokens == retained_num_computed_tokens
+    resumed_block_ids = scheduler.kv_cache_manager.get_block_ids("low")
+    for before, after in zip(retained_block_ids, resumed_block_ids):
+        assert after[: len(before)] == before
+
+
+def test_strict_priority_preemption_recomputes_when_kv_is_full():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2,
+        max_num_batched_tokens=200,
+        num_blocks=6,
+        block_size=16,
+        enable_strict_priority_preemption=True,
+    )
+    low = create_requests_with_priority(
+        num_requests=1,
+        priorities=[10],
+        arrival_times=[1.0],
+        num_tokens=32,
+        req_ids=["low"],
+    )[0]
+    scheduler.add_request(low)
+
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, make_output(scheduler))
+    assert low.num_computed_tokens == 32
+    assert scheduler.kv_cache_manager.get_block_ids("low")[0]
+
+    high = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=64,
+        req_ids=["high"],
+    )[0]
+    scheduler.add_request(high)
+
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in scheduler.running] == ["high"]
+    assert low.status == RequestStatus.PREEMPTED
+    assert low.num_computed_tokens == 0
+    assert scheduler.kv_cache_manager.get_block_ids("low") == ([],)
+    assert "low" not in scheduler._retained_preempted_req_ids
+    assert output.num_scheduled_tokens == {"high": 64}
+
+
+def test_strict_priority_preemption_allows_same_priority_batching():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2,
+        max_num_batched_tokens=200,
+        enable_strict_priority_preemption=True,
+    )
+    requests = create_requests_with_priority(
+        num_requests=2,
+        priorities=[1, 1],
+        arrival_times=[1.0, 2.0],
+        num_tokens=32,
+        req_ids=["first", "second"],
+    )
+    scheduler.add_request(requests[0])
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, make_output(scheduler))
+    scheduler.add_request(requests[1])
+
+    output = scheduler.schedule()
+
+    assert {request.request_id for request in scheduler.running} == {
+        "first",
+        "second",
+    }
+    assert not output.preempted_req_ids
+    assert not scheduler._retained_preempted_req_ids
+
+
+def test_strict_priority_preemption_skips_blocked_higher_priority_request():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2,
+        max_num_batched_tokens=200,
+        enable_strict_priority_preemption=True,
+    )
+    low, blocked, high = create_requests_with_priority(
+        num_requests=3,
+        priorities=[10, 0, 5],
+        arrival_times=[1.0, 2.0, 3.0],
+        num_tokens=32,
+        req_ids=["low", "blocked", "high"],
+    )
+    scheduler.add_request(low)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, make_output(scheduler))
+
+    blocked.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+    blocked.structured_output_request = Mock(grammar=None)
+    scheduler.add_request(blocked)
+    scheduler.add_request(high)
+
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in scheduler.running] == ["high"]
+    assert low.status == RequestStatus.PREEMPTED
+    assert blocked.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+    assert output.preempted_req_ids == {"low"}
+
+
+def test_strict_priority_preemption_switches_active_lora():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2,
+        max_num_batched_tokens=200,
+        enable_strict_priority_preemption=True,
+        lora_config=LoRAConfig(max_loras=1, max_lora_rank=64),
+    )
+    low, high = create_requests_with_priority(
+        num_requests=2,
+        priorities=[10, 0],
+        arrival_times=[1.0, 2.0],
+        num_tokens=32,
+        req_ids=["lora-a", "lora-b"],
+    )
+    low.lora_request = LoRARequest("lora-a", 1, "/tmp/lora-a")
+    high.lora_request = LoRARequest("lora-b", 2, "/tmp/lora-b")
+    scheduler.add_request(low)
+
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, make_output(scheduler))
+    scheduler.add_request(high)
+
+    output = scheduler.schedule()
+
+    assert [request.request_id for request in scheduler.running] == ["lora-b"]
+    assert low.status == RequestStatus.PREEMPTED
+    assert "lora-a" in scheduler._retained_preempted_req_ids
+    assert output.num_scheduled_tokens == {"lora-b": 32}
+
+
+def test_finishing_retained_request_releases_kv():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2,
+        max_num_batched_tokens=200,
+        enable_strict_priority_preemption=True,
+    )
+    low, high = create_requests_with_priority(
+        num_requests=2,
+        priorities=[10, 0],
+        arrival_times=[1.0, 2.0],
+        num_tokens=32,
+        req_ids=["low", "high"],
+    )
+    scheduler.add_request(low)
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, make_output(scheduler))
+    scheduler.add_request(high)
+    scheduler.schedule()
+
+    free_blocks_before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    scheduler.finish_requests("low", RequestStatus.FINISHED_ABORTED)
+
+    assert "low" not in scheduler._retained_preempted_req_ids
+    assert scheduler.kv_cache_manager.get_block_ids("low") == ([],)
+    assert (
+        scheduler.kv_cache_manager.block_pool.get_num_free_blocks() > free_blocks_before
+    )
+
+
+def test_strict_priority_preemption_config_validation():
+    with pytest.raises(ValueError, match="requires policy='priority'"):
+        SchedulerConfig.default_factory(enable_strict_priority_preemption=True)
+
+    with pytest.raises(ValueError, match="requires synchronous scheduling"):
+        SchedulerConfig.default_factory(
+            policy="priority",
+            async_scheduling=True,
+            enable_strict_priority_preemption=True,
+        )
+
+    config = SchedulerConfig.default_factory(
+        policy="priority",
+        enable_strict_priority_preemption=True,
+    )
+    assert config.async_scheduling is False
 
 
 def test_priority_scheduling_preemption_victim_selection():

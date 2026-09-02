@@ -184,6 +184,28 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        self.enable_strict_priority_preemption = (
+            self.scheduler_config.enable_strict_priority_preemption
+        )
+        if self.enable_strict_priority_preemption:
+            if self.policy != SchedulingPolicy.PRIORITY:
+                raise ValueError(
+                    "Strict priority preemption requires priority scheduling"
+                )
+            if self.vllm_config.max_concurrent_batches != 1:
+                raise ValueError(
+                    "Strict priority preemption currently requires synchronous "
+                    "scheduling without pipeline parallelism"
+                )
+            if self.parallel_config.world_size_across_dp != 1:
+                raise ValueError(
+                    "Strict priority preemption currently supports a single device only"
+                )
+            if self.connector is not None:
+                raise ValueError(
+                    "Strict priority preemption is not compatible with KV "
+                    "connectors yet"
+                )
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         # requests skipped in waiting flow due async deps or constraints.
@@ -198,6 +220,8 @@ class Scheduler(SchedulerInterface):
 
         # IDs of requests preempted since the last call to schedule().
         self.reset_preempted_req_ids: set[str] = set()
+        # Preempted requests that still own their GPU KV blocks.
+        self._retained_preempted_req_ids: set[str] = set()
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -475,6 +499,9 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        if self.enable_strict_priority_preemption:
+            self._preempt_for_strict_priority(scheduled_timestamp)
+
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
         defer_prefills = (
@@ -585,6 +612,14 @@ class Scheduler(SchedulerInterface):
                     if new_blocks is not None:
                         # The request can be scheduled.
                         break
+
+                    if (
+                        self.enable_strict_priority_preemption
+                        and self._release_retained_preempted_request(
+                            request.priority, request.request_id
+                        )
+                    ):
+                        continue
 
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -721,6 +756,12 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                if self.enable_strict_priority_preemption and self.running:
+                    running_priority = min(req.priority for req in self.running)
+                    assert request.priority >= running_priority
+                    if request.priority > running_priority:
+                        break
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -985,6 +1026,26 @@ class Scheduler(SchedulerInterface):
                     has_scheduled_reqs=bool(self.running),
                 )
 
+                while new_blocks is None and (
+                    self.enable_strict_priority_preemption
+                    and self._release_retained_preempted_request(
+                        request.priority, request.request_id
+                    )
+                ):
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        reserved_blocks=reserved_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
+
                 if new_blocks is None:
                     # The request cannot be scheduled.
 
@@ -992,6 +1053,13 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if (
+                        self.enable_strict_priority_preemption
+                        and request_id in self._retained_preempted_req_ids
+                    ):
+                        self._free_request_blocks(request)
+                        request.num_computed_tokens = 0
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1074,6 +1142,7 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                self._retained_preempted_req_ids.discard(request_id)
                 if pad_spec_decode:
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
@@ -1272,8 +1341,61 @@ class Scheduler(SchedulerInterface):
 
         return new_block_ids_to_zero or None
 
+    def _preempt_for_strict_priority(self, timestamp: float) -> None:
+        if not self.running or self._pause_state != PauseState.UNPAUSED:
+            return
+
+        active_priority = min(request.priority for request in self.running)
+        for request_queue in (self.waiting, self.skipped_waiting):
+            for waiting_request in request_queue:
+                if self._is_blocked_waiting_status(
+                    waiting_request.status
+                ) and not self._try_promote_blocked_waiting_request(waiting_request):
+                    continue
+                if waiting_request.num_stale_output_tokens == 0:
+                    active_priority = min(active_priority, waiting_request.priority)
+                    break
+
+        preempted = [
+            request for request in self.running if request.priority > active_priority
+        ]
+        if not preempted:
+            return
+
+        self.running = remove_all(self.running, set(preempted))
+        for request in preempted:
+            self._preempt_request(request, timestamp, retain_kv=True)
+
+    def _release_retained_preempted_request(
+        self,
+        priority: int,
+        exclude_request_id: str | None = None,
+    ) -> bool:
+        candidates = [
+            self.requests[req_id]
+            for req_id in self._retained_preempted_req_ids
+            if req_id != exclude_request_id
+            and req_id in self.requests
+            and self.requests[req_id].status == RequestStatus.PREEMPTED
+            and self.requests[req_id].priority >= priority
+        ]
+        if not candidates:
+            return False
+
+        request = max(
+            candidates,
+            key=lambda req: (req.priority, req.arrival_time, req.request_id),
+        )
+        self._free_request_blocks(request)
+        request.num_computed_tokens = 0
+        return True
+
     def _preempt_request(
-        self, request: Request, timestamp: float, drop_stale_output: bool = False
+        self,
+        request: Request,
+        timestamp: float,
+        drop_stale_output: bool = False,
+        retain_kv: bool = False,
     ) -> None:
         """Preempt a request and put it back to the waiting queue.
 
@@ -1284,15 +1406,22 @@ class Scheduler(SchedulerInterface):
         by reset_prefix_cache, whose same-step resume would otherwise deliver
         tokens out of order, and for connectors with a pending KV hand-off,
         which the preemption's block free would leave without valid KV.
+
+        retain_kv: keep the request's GPU KV blocks and computed-token position
+        so that it can resume without recomputation.
         """
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        self._free_request_blocks(request)
+        if retain_kv:
+            self._retained_preempted_req_ids.add(request.request_id)
+        else:
+            self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
-        request.num_computed_tokens = 0
+        if not retain_kv:
+            request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2354,6 +2483,7 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        self._retained_preempted_req_ids.discard(request.request_id)
         if not self.defer_block_free or (
             # Last scheduled step already processed: no in-flight write remains
             # (always the case for a normal finish), so free now.

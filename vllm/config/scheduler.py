@@ -104,6 +104,12 @@ class SchedulerConfig:
     - "priority" means requests are handled based on given priority (lower
       value means earlier handling) and time of arrival deciding any ties)."""
 
+    enable_strict_priority_preemption: bool = False
+    """If True, a waiting request with higher priority preempts lower-priority
+    running requests. Preempted requests retain their GPU KV cache when possible
+    and fall back to recomputation under KV cache pressure. This experimental
+    mode currently supports synchronous single-device execution only."""
+
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
     partially schedule a multimodal item. Only used in V1
@@ -225,6 +231,17 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        if self.enable_strict_priority_preemption:
+            if self.policy != "priority":
+                raise ValueError(
+                    "enable_strict_priority_preemption requires policy='priority'"
+                )
+            if self.async_scheduling:
+                raise ValueError(
+                    "enable_strict_priority_preemption requires synchronous scheduling"
+                )
+            self.async_scheduling = False
+
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True
