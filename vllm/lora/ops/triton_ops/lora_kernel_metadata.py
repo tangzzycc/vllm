@@ -9,6 +9,53 @@ from dataclasses import dataclass, field
 
 import torch
 
+from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _prepare_uniform_lora_metadata_kernel(
+    token_lora_mapping,
+    token_indices_sorted_by_lora_ids,
+    active_lora_ids,
+    num_tokens_per_lora,
+    lora_token_start_loc,
+    num_tokens,
+    num_mapping_slots,
+    num_lora_slots,
+    num_start_slots,
+    lora_id,
+    num_lora_tokens,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    token_mask = offsets < num_tokens
+    mapping_mask = offsets < num_mapping_slots
+    tl.store(
+        token_lora_mapping + offsets,
+        tl.where(token_mask, lora_id, -1),
+        mask=mapping_mask,
+    )
+    tl.store(token_indices_sorted_by_lora_ids + offsets, offsets, mask=token_mask)
+
+    lora_mask = offsets < num_lora_slots
+    tl.store(
+        active_lora_ids + offsets,
+        tl.where(offsets == 0, lora_id, -1),
+        mask=lora_mask,
+    )
+    tl.store(
+        num_tokens_per_lora + offsets,
+        tl.where(offsets == 0, num_lora_tokens, 0),
+        mask=lora_mask,
+    )
+
+    start_mask = offsets < num_start_slots
+    tl.store(
+        lora_token_start_loc + offsets,
+        tl.where(offsets == 1, num_lora_tokens, 0),
+        mask=start_mask,
+    )
+
 
 @dataclass
 class LoRAKernelMeta:
@@ -45,6 +92,7 @@ class LoRAKernelMeta:
     # to the nearest value in this list to match cudagraph capture keys.
     # Empty list means no specialization (use actual count).
     captured_lora_counts: list[int] = field(default_factory=list)
+    _num_tokens: int = 0
 
     @staticmethod
     def make(
@@ -53,8 +101,8 @@ class LoRAKernelMeta:
         device: torch.device | str,
         captured_lora_counts: list[int] | None = None,
     ) -> "LoRAKernelMeta":
-        token_lora_mapping = torch.empty(
-            max_num_tokens, dtype=torch.int32, device=device
+        token_lora_mapping = torch.full(
+            (max_num_tokens,), -1, dtype=torch.int32, device=device
         )
 
         token_indices_sorted_by_lora_ids = torch.empty(
@@ -117,15 +165,20 @@ class LoRAKernelMeta:
 
         self._reset()
 
+        num_tokens = token_lora_mapping.size(0)
+        previous_num_tokens = self._num_tokens
+        self._num_tokens = num_tokens
+        if num_tokens < previous_num_tokens:
+            self.token_lora_mapping[num_tokens:previous_num_tokens].fill_(-1)
+
         # Check and record no-lora case.
         no_lora = torch.all(token_lora_mapping == -1)
         self.no_lora_flag_cpu[0] = no_lora
 
         if no_lora:
             # Early exit. LoRA kernels will not be run.
+            self.token_lora_mapping[:num_tokens].fill_(-1)
             return
-
-        num_tokens = token_lora_mapping.size(0)
 
         # copy token lora mapping
         self.token_lora_mapping[:num_tokens].copy_(
@@ -165,6 +218,44 @@ class LoRAKernelMeta:
         lora_token_start_loc = torch.cumsum(num_tokens_per_lora, dim=0)
         self.lora_token_start_loc[1 : 1 + lora_token_start_loc.size(0)].copy_(
             lora_token_start_loc, non_blocking=True
+        )
+
+    def prepare_tensors_uniform(self, num_tokens: int, lora_id: int) -> None:
+        """Prepare metadata when every token uses the same LoRA slot."""
+        previous_num_tokens = self._num_tokens
+        self._num_tokens = num_tokens
+        num_mapping_slots = max(num_tokens, previous_num_tokens)
+        no_lora = lora_id < 0 or num_tokens == 0
+        metadata_lora_id = -1 if no_lora else lora_id
+        num_lora_tokens = 0 if no_lora else num_tokens
+
+        self.no_lora_flag_cpu.fill_(no_lora)
+        num_active_loras = 0 if no_lora else 1
+        if self.captured_lora_counts and num_active_loras > 0:
+            idx = bisect.bisect_left(self.captured_lora_counts, num_active_loras)
+            if idx < len(self.captured_lora_counts):
+                num_active_loras = self.captured_lora_counts[idx]
+        self.num_active_loras_cpu.fill_(num_active_loras)
+        block_size = 256
+        num_items = max(
+            num_mapping_slots,
+            self.active_lora_ids.numel(),
+            self.lora_token_start_loc.numel(),
+        )
+        _prepare_uniform_lora_metadata_kernel[(triton.cdiv(num_items, block_size),)](
+            self.token_lora_mapping,
+            self.token_indices_sorted_by_lora_ids,
+            self.active_lora_ids,
+            self.num_tokens_per_lora,
+            self.lora_token_start_loc,
+            num_tokens,
+            num_mapping_slots,
+            self.active_lora_ids.numel(),
+            self.lora_token_start_loc.numel(),
+            metadata_lora_id,
+            num_lora_tokens,
+            block_size,
+            num_warps=1,
         )
 
     def meta_args(

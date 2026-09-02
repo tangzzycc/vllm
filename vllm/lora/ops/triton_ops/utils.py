@@ -22,6 +22,16 @@ _LORA_A_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
 _LORA_B_PTR_DICT: dict[tuple[int, ...], tuple[torch.tensor, ...]] = {}
 
 
+def get_lora_kernel_grid_dim(
+    num_active_loras: torch.Tensor, lora_ids: torch.Tensor
+) -> int:
+    """Cover active LoRAs plus the optional base/no-LoRA metadata group."""
+    active_loras = int(num_active_loras.item())
+    if active_loras == 0:
+        return 0
+    return min(active_loras + 1, lora_ids.size(0))
+
+
 def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):
     """
     `_LORA_A_PTR_DICT` collects the required information during `profile_run`,

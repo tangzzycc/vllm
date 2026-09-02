@@ -11,10 +11,15 @@ from typing import final
 
 import torch
 
+from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.utils import get_captured_lora_counts
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.utils.math_utils import round_up
+
+from .punica_base import PunicaWrapperBase
 
 if HAS_TRITON:
     from vllm.lora.ops.triton_ops import (
@@ -24,9 +29,31 @@ if HAS_TRITON:
         lora_shrink,
     )
 
-from vllm import _custom_ops as ops
+    rdna_lora_shrink = None
+    can_use_rdna_lora_shrink = None
+    get_rdna_lora_shrink_config = None
+    if envs.VLLM_ROCM_USE_RDNA_LORA_SHRINK and current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1151
 
-from .punica_base import PunicaWrapperBase
+        if on_gfx1151():
+            from vllm.lora.ops.triton_ops.rdna_lora_shrink import (
+                can_use_rdna_lora_shrink,
+                get_rdna_lora_shrink_config,
+                rdna_lora_shrink,
+            )
+
+    rdna_lora_expand = None
+    can_use_rdna_lora_expand = None
+    get_rdna_lora_expand_config = None
+    if envs.VLLM_ROCM_USE_RDNA_LORA_EXPAND and current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1151
+
+        if on_gfx1151():
+            from vllm.lora.ops.triton_ops.rdna_lora_expand import (
+                can_use_rdna_lora_expand,
+                get_rdna_lora_expand_config,
+                rdna_lora_expand,
+            )
 
 
 @final
@@ -83,9 +110,42 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self.is_prefill = mapping.is_prefill
         self._update_base_metadata(mapping, lora_index_to_id, max_loras, vocab_size)
 
-        # Prepare cuda kernel metadata tensors
-        self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
-        self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
+        use_rdna_metadata = HAS_TRITON and (
+            rdna_lora_shrink is not None or rdna_lora_expand is not None
+        )
+        token_lora_index = self._uniform_lora_index(
+            mapping.index_mapping, lora_index_to_id
+        )
+        prompt_lora_index = self._uniform_lora_index(
+            mapping.prompt_mapping, lora_index_to_id
+        )
+
+        if use_rdna_metadata and token_lora_index is not None:
+            self.token_mapping_meta.prepare_tensors_uniform(
+                len(mapping.index_mapping), token_lora_index
+            )
+        else:
+            self.token_mapping_meta.prepare_tensors(self.token_lora_indices)
+
+        if use_rdna_metadata and prompt_lora_index is not None:
+            self.prompt_mapping_meta.prepare_tensors_uniform(
+                len(mapping.prompt_mapping), prompt_lora_index
+            )
+        else:
+            self.prompt_mapping_meta.prepare_tensors(self.sampler_indices)
+
+    @staticmethod
+    def _uniform_lora_index(
+        adapter_ids: tuple[int, ...], lora_index_to_id: list[int | None]
+    ) -> int | None:
+        if not adapter_ids:
+            return -1
+        adapter_id = adapter_ids[0]
+        if any(candidate != adapter_id for candidate in adapter_ids[1:]):
+            return None
+        if adapter_id <= 0:
+            return -1
+        return lora_index_to_id.index(adapter_id)
 
     def add_shrink(
         self,
@@ -110,7 +170,21 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
-        lora_shrink(
+        shrink_op = lora_shrink
+        if (
+            rdna_lora_shrink is not None
+            and can_use_rdna_lora_shrink is not None
+            and get_rdna_lora_shrink_config is not None
+        ):
+            config = get_rdna_lora_shrink_config(lora_a_stacked)
+            if config is not None:
+                num_tokens = x.size(0)
+                mapping = self.token_mapping_meta.token_lora_mapping[:num_tokens]
+                if can_use_rdna_lora_shrink(
+                    x, lora_a_stacked, y, mapping, config=config
+                ):
+                    shrink_op = rdna_lora_shrink
+        shrink_op(
             x,
             lora_a_stacked,
             y,
@@ -155,7 +229,26 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         assert x.size(0) == len(output_slices)
         num_tokens = x.size(1)  # first dimension is the num slices
 
-        lora_expand(
+        expand_op = lora_expand
+        if (
+            rdna_lora_expand is not None
+            and can_use_rdna_lora_expand is not None
+            and get_rdna_lora_expand_config is not None
+        ):
+            config = get_rdna_lora_expand_config(lora_b_stacked)
+            if config is not None:
+                mapping = self.token_mapping_meta.token_lora_mapping[:num_tokens]
+                if can_use_rdna_lora_expand(
+                    x,
+                    lora_b_stacked,
+                    y,
+                    mapping,
+                    offset_start,
+                    output_slices,
+                    config,
+                ):
+                    expand_op = rdna_lora_expand
+        expand_op(
             x,
             lora_b_stacked,
             y,
