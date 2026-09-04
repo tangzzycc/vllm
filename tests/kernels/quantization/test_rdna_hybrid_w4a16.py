@@ -32,6 +32,33 @@ SUPPORTED_GROUP_SIZES = hybrid_module.SUPPORTED_GROUP_SIZES
 MAX_SKINNY_BATCH_SIZE = hybrid_module.MAX_SKINNY_BATCH_SIZE
 
 
+@pytest.mark.parametrize(
+    "M,N,K,expected",
+    [
+        (257, 12288, 4096, (64, 128, 64, 4)),
+        (257, 4096, 4096, (64, 256, 64, 8)),
+        (257, 22016, 4096, (64, 128, 64, 4)),
+        (257, 4096, 11008, (64, 256, 64, 8)),
+        (279, 1024, 4096, (64, 32, 128, 2)),
+        (279, 4096, 1024, (64, 64, 64, 2)),
+        (6400, 2048, 1024, (64, 256, 64, 8)),
+        (321, 4096, 11008, None),
+        (289, 1024, 4096, None),
+    ],
+)
+def test_gfx1151_bf16_prefill_config(M, N, K, expected):
+    config = hybrid_module._get_gfx1151_bf16_prefill_config(M, N, K, 128)
+    assert config == expected
+
+
+def test_gfx1151_bf16_prefill_config_is_selected(monkeypatch):
+    monkeypatch.setattr(hybrid_module, "_on_gfx1151", lambda: True)
+    config = hybrid_module._select_skinny_gfx11_config(
+        257, 12288, 4096, 128, torch.bfloat16
+    )
+    assert config == (64, 128, 64, 4)
+
+
 # ---------------------------------------------------------------------------
 # Reference implementation
 # ---------------------------------------------------------------------------

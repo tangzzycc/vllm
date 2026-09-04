@@ -13,6 +13,7 @@ weight copy. The triton kernel transposes tiles in-register.
 """
 
 from contextlib import nullcontext
+from typing import NamedTuple
 
 import torch
 
@@ -316,6 +317,60 @@ def _triton_w4a16_skinny_fmt_kernel(
 #
 # BLOCK_K is capped to group_size so a K-block never straddles a quant group
 # (scale aliasing); gs128 -- the bulk -- passes the table BLOCK_K through.
+# Cold-weight sweeps on gfx1151. Exact dimensions keep the generic fallback
+# unchanged for unmeasured shapes; M ranges include the validated neighboring
+# token counts rather than only the traced request sizes.
+
+
+class _W4A16TileConfig(NamedTuple):
+    block_m: int
+    block_n: int
+    block_k: int
+    num_warps: int
+
+
+class _W4A16PrefillConfig(NamedTuple):
+    min_m: int
+    max_m: int
+    tile: _W4A16TileConfig
+
+
+_GFX1151_BF16_PREFILL_CONFIGS: dict[
+    tuple[int, int, int], tuple[_W4A16PrefillConfig, ...]
+] = {
+    (12288, 4096, 128): (
+        _W4A16PrefillConfig(192, 512, _W4A16TileConfig(64, 128, 64, 4)),
+    ),
+    (4096, 4096, 128): (
+        _W4A16PrefillConfig(192, 512, _W4A16TileConfig(64, 256, 64, 8)),
+    ),
+    (22016, 4096, 128): (
+        _W4A16PrefillConfig(128, 512, _W4A16TileConfig(64, 128, 64, 4)),
+    ),
+    (4096, 11008, 128): (
+        _W4A16PrefillConfig(128, 320, _W4A16TileConfig(64, 256, 64, 8)),
+    ),
+    (1024, 4096, 128): (
+        _W4A16PrefillConfig(128, 288, _W4A16TileConfig(64, 32, 128, 2)),
+    ),
+    (4096, 1024, 128): (
+        _W4A16PrefillConfig(128, 512, _W4A16TileConfig(64, 64, 64, 2)),
+    ),
+    (2048, 1024, 128): (
+        _W4A16PrefillConfig(1024, 8192, _W4A16TileConfig(64, 256, 64, 8)),
+    ),
+}
+
+
+def _get_gfx1151_bf16_prefill_config(
+    M: int, N: int, K: int, group_size: int
+) -> _W4A16TileConfig | None:
+    for config in _GFX1151_BF16_PREFILL_CONFIGS.get((N, K, group_size), ()):
+        if config.min_m <= M <= config.max_m:
+            return config.tile
+    return None
+
+
 def _select_skinny_gfx11_config(
     M: int, N: int, K: int, group_size: int, dtype: torch.dtype
 ) -> tuple[int, int, int, int]:
@@ -382,7 +437,12 @@ def _select_skinny_gfx11_config(
             block_n = min(block_n, 32)
     else:
         # Scalar-dequant path (bf16): pre-packed-kernel scalar-tuned table.
-        if _on_gfx1103() and M > 256:
+        tuned_config = None
+        if _on_gfx1151():
+            tuned_config = _get_gfx1151_bf16_prefill_config(M, N, K, group_size)
+        if tuned_config is not None:
+            block_m, block_n, block_k, num_warps = tuned_config
+        elif _on_gfx1103() and M > 256:
             # Tested on Qwen3-VL-4B-AWQ
             block_m, block_n, block_k, num_warps = 64, 256, 64, 8
         elif M <= 32:

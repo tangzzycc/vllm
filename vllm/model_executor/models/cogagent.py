@@ -19,6 +19,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -37,7 +38,7 @@ from vllm.model_executor.models.cogagent_vision_encoder import (
     EVA2CLIPModel,
     sharded_weight_loader,
 )
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import SupportsMultiModal, SupportsQuant
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -126,6 +127,7 @@ class MLP(nn.Module):
     def __init__(
         self,
         config: "CogAgentConfig",
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -136,6 +138,7 @@ class MLP(nn.Module):
             self.hidden_size,
             [self.intermediate_size] * 2,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
 
@@ -143,6 +146,7 @@ class MLP(nn.Module):
             self.intermediate_size,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
 
@@ -157,8 +161,9 @@ class MLP(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         weights_mapper = {
-            "gate_proj.weight": ("gate_proj", "gate_up_proj", 0),
-            "up_proj.weight": ("up_proj", "gate_up_proj", 1),
+            f"{source}.{suffix}": (source, "gate_up_proj", shard_id)
+            for source, shard_id in (("gate_proj", 0), ("up_proj", 1))
+            for suffix in ("weight", "qweight", "qzeros", "scales")
         }
 
         loaded_params = sharded_weight_loader(
@@ -169,11 +174,24 @@ class MLP(nn.Module):
 
 
 class VisionExpertMLP(nn.Module):
-    def __init__(self, config, prefix: str = ""):
+    def __init__(
+        self,
+        config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
 
-        self.language_mlp = MLP(config, prefix=f"{prefix}.language_mlp")
-        self.vision_mlp = MLP(config, prefix=f"{prefix}.vision_mlp")
+        self.language_mlp = MLP(
+            config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.language_mlp",
+        )
+        self.vision_mlp = MLP(
+            config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.vision_mlp",
+        )
 
     def forward(
         self,
@@ -198,6 +216,7 @@ class VisionExpertAttention(nn.Module):
         self,
         config: "CogAgentConfig",
         cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -221,6 +240,7 @@ class VisionExpertAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.num_heads,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.vision_expert_query_key_value",
         )
 
@@ -228,6 +248,7 @@ class VisionExpertAttention(nn.Module):
             self.hidden_size,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.vision_expert_dense",
         )
 
@@ -236,6 +257,7 @@ class VisionExpertAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.num_heads,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.language_expert_query_key_value",
         )
 
@@ -243,6 +265,7 @@ class VisionExpertAttention(nn.Module):
             self.hidden_size,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.language_expert_dense",
         )
 
@@ -321,6 +344,7 @@ class CogAgentCrossAttention(nn.Module):
         self,
         config: "CogAgentConfig",
         cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -340,6 +364,7 @@ class CogAgentCrossAttention(nn.Module):
             input_size=self.hidden_size,
             output_size=self.cross_compute_hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.query",
         )
 
@@ -349,6 +374,7 @@ class CogAgentCrossAttention(nn.Module):
             total_num_heads=0,
             total_num_kv_heads=self.num_heads,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.key_value",
         )
 
@@ -356,6 +382,7 @@ class CogAgentCrossAttention(nn.Module):
             input_size=self.cross_compute_hidden_size,
             output_size=self.hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.dense",
         )
 
@@ -376,7 +403,7 @@ class CogAgentCrossAttention(nn.Module):
             key_states = None
             value_states = None
         else:
-            encoder_states, _ = self.key_value(encoder_embeds)
+            encoder_states, _ = self.key_value(encoder_embeds.contiguous())
             key_states, value_states = encoder_states.chunk(2, dim=-1)
 
         context_layer = self.cross_attn(
@@ -394,6 +421,7 @@ class CogAgentDecoderLayer(nn.Module):
         self,
         config: "CogAgentConfig",
         cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -407,14 +435,20 @@ class CogAgentDecoderLayer(nn.Module):
         self.self_attn = VisionExpertAttention(
             config=config,
             cache_config=cache_config,
+            quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
         self.cross_attn = CogAgentCrossAttention(
             config=config,
             cache_config=cache_config,
+            quant_config=quant_config,
             prefix=f"{prefix}.cross_attn",
         )
-        self.mlp = VisionExpertMLP(config, prefix=f"{prefix}.mlp")
+        self.mlp = VisionExpertMLP(
+            config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
 
         self.input_layernorm = CogAgentRMSNorm(
             config.hidden_size,
@@ -481,6 +515,7 @@ class CogAgentModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
 
         self.hf_config = vllm_config.model_config.hf_config  # type: CogAgentConfig
         self.vocab_size = self.hf_config.vocab_size
@@ -497,6 +532,7 @@ class CogAgentModel(nn.Module):
                 CogAgentDecoderLayer(
                     self.hf_config,
                     cache_config=cache_config,
+                    quant_config=quant_config,
                     prefix=f"{prefix}.layers.{i}",
                 )
                 for i in range(self.hf_config.num_hidden_layers)
@@ -538,7 +574,7 @@ class CogAgentModel(nn.Module):
     info=CogAgentProcessingInfo,
     dummy_inputs=CogAgentDummyInputsBuilder,
 )
-class CogAgentForCausalLM(nn.Module, SupportsMultiModal):
+class CogAgentForCausalLM(nn.Module, SupportsMultiModal, SupportsQuant):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_suffix={
             "linear_proj.gate_proj.weight": "linear_proj.glu_gate_proj.weight"
@@ -573,8 +609,6 @@ class CogAgentForCausalLM(nn.Module, SupportsMultiModal):
             raise ValueError("CogAgent currently supports only bfloat16 inference")
         if self.hf_config.tie_word_embeddings:
             raise ValueError("CogAgent does not support tied word embeddings")
-        if vllm_config.quant_config is not None:
-            raise ValueError("CogAgent does not currently support quantization")
         if vllm_config.ec_transfer_config is not None:
             raise ValueError("CogAgent does not support encoder cache transfer")
         if model_config.enable_prompt_embeds:
