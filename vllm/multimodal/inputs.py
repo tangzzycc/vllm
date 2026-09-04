@@ -240,8 +240,8 @@ def nested_tensors_equal(
 
     If `check_dtype` is `True`, the tensors must have the same dtype.
     """
-    check_dtype_func = (
-        lambda a, b, check_dtype: a.dtype == b.dtype if check_dtype else True
+    check_dtype_func = lambda a, b, check_dtype: (
+        a.dtype == b.dtype if check_dtype else True
     )
     if isinstance(a, torch.Tensor):
         return (
@@ -302,9 +302,11 @@ def _nested_tensors_h2d(
 
     return json_map_leaves(
         (
-            lambda x: x.to(device=device, non_blocking=True)
-            if isinstance(x, torch.Tensor)
-            else x
+            lambda x: (
+                x.to(device=device, non_blocking=True)
+                if isinstance(x, torch.Tensor)
+                else x
+            )
         ),
         tensors,
     )
@@ -357,6 +359,26 @@ class MultiModalFeatureSpec:
 
     mm_hash: str | None = None
     """The hash for caching processor outputs (without LoRA prefix)."""
+
+    encoder_output_seq_len: int | None = None
+    """The number of embeddings produced by the multimodal encoder."""
+
+    cross_attention_seq_len: int | None = None
+    """The number of encoder tokens stored in the cross-attention KV cache.
+
+    When unset, this defaults to ``encoder_output_seq_len``, which itself
+    defaults to the decoder-side multimodal embedding count.
+    """
+
+    def get_num_encoder_output_tokens(self) -> int:
+        if self.encoder_output_seq_len is not None:
+            return self.encoder_output_seq_len
+        return self.mm_position.get_num_embeds()
+
+    def get_num_cross_attention_tokens(self) -> int:
+        if self.cross_attention_seq_len is not None:
+            return self.cross_attention_seq_len
+        return self.get_num_encoder_output_tokens()
 
     @staticmethod
     def gather_kwargs(features: list["MultiModalFeatureSpec"], keys: set[str]):

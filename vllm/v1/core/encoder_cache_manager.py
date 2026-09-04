@@ -273,6 +273,8 @@ class EncoderCacheManager:
 def compute_mm_encoder_budget(
     scheduler_config: "SchedulerConfig",
     mm_max_toks_per_item: Mapping[str, int],
+    *,
+    is_encoder_decoder: bool = False,
 ) -> tuple[int, int]:
     """Compute the encoder cache budget based on the model and scheduler
     configurations for a multimodal model.
@@ -281,6 +283,8 @@ def compute_mm_encoder_budget(
         scheduler_config: Scheduler configuration.
         mm_max_toks_per_item: The maximum number of tokens per item for each
             non-text modality.
+        is_encoder_decoder: Whether encoder work is independent of the decoder
+            token batch budget.
 
     Returns:
         - Compute budget for encoder execution, measured in number of tokens
@@ -300,7 +304,8 @@ def compute_mm_encoder_budget(
     max_tokens_per_mm_item = max(mm_max_toks_per_item.values())
 
     if (
-        scheduler_config.disable_chunked_mm_input
+        not is_encoder_decoder
+        and scheduler_config.disable_chunked_mm_input
         and max_tokens_per_mm_item > scheduler_config.max_num_batched_tokens
     ):
         raise ValueError(

@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
 
+from vllm.inputs import EncoderDecoderInput, tokens_input
 from vllm.renderers.inputs.preprocess import (
+    extract_generation_prompt_len,
     parse_dec_only_prompt,
     parse_enc_dec_prompt,
     prompt_to_seq,
@@ -65,3 +67,19 @@ def test_parse_enc_dec_prompt_rejects_nested_non_string_prompt_field():
                 "decoder_prompt": {"prompt": [4, 5]},
             }
         )
+
+
+def test_extract_generation_prompt_len_decoder_only():
+    prompt = tokens_input([1, 2, 3])
+
+    assert extract_generation_prompt_len(prompt) == 3
+
+
+def test_extract_generation_prompt_len_encoder_decoder_uses_decoder():
+    prompt = EncoderDecoderInput(
+        type="enc_dec",
+        encoder_prompt=tokens_input(list(range(6400))),
+        decoder_prompt=tokens_input(list(range(300))),
+    )
+
+    assert extract_generation_prompt_len(prompt) == 300

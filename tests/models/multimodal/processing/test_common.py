@@ -73,6 +73,14 @@ def glmasr_patch_mm_data(mm_data: MultiModalDataDict) -> MultiModalDataDict:
     return mm_data
 
 
+def cogagent_patch_mm_data(mm_data: MultiModalDataDict) -> MultiModalDataDict:
+    """CogAgent requires exactly one image in every request."""
+    images = mm_data.get("image")
+    if images is None or (isinstance(images, list) and len(images) == 0):
+        mm_data["image"] = Image.new("RGB", size=(128, 128))
+    return mm_data
+
+
 _IGNORE_MM_KEYS = {
     # In Ultravox, the audio_features can be different depending on padding
     # The slight difference should not be a problem though, since
@@ -81,6 +89,7 @@ _IGNORE_MM_KEYS = {
 }
 
 MM_DATA_PATCHES = {
+    "cogagent": cogagent_patch_mm_data,
     "glmasr": glmasr_patch_mm_data,
 }
 

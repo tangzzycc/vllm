@@ -124,6 +124,7 @@ class MultiModalBudget:
         encoder_compute_budget, encoder_cache_size = compute_mm_encoder_budget(
             scheduler_config,
             active_mm_max_toks_per_item,
+            is_encoder_decoder=model_config.is_encoder_decoder,
         )
 
         self.encoder_compute_budget = encoder_compute_budget

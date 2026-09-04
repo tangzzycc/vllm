@@ -53,7 +53,7 @@ from .inputs import (
     SingletonTokPrompt,
     TokPrompt,
 )
-from .inputs.preprocess import extract_target_prompt
+from .inputs.preprocess import extract_target_prompt, parse_model_prompt
 from .params import ChatParams, TokenizeParams
 
 if TYPE_CHECKING:
@@ -1055,7 +1055,7 @@ class BaseRenderer(ABC, Generic[_T]):
         dict_prompts = list[DictPrompt]()
         for conv, prompt in rendered:
             out_conversations.append(conv)
-            dict_prompts.append(prompt)
+            dict_prompts.append(parse_model_prompt(self.model_config, prompt))
 
         tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
 
@@ -1091,7 +1091,7 @@ class BaseRenderer(ABC, Generic[_T]):
         dict_prompts = list[DictPrompt]()
         for conv, prompt in await asyncio.gather(*rendered):
             out_conversations.append(conv)
-            dict_prompts.append(prompt)
+            dict_prompts.append(parse_model_prompt(self.model_config, prompt))
 
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 

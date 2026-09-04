@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -163,6 +164,20 @@ spec_args_map: dict[type[KVCacheSpec], dict[str, Any]] = {
 
 def make_spec(spec_cls: type[KVCacheSpec]) -> KVCacheSpec:
     return spec_cls(**spec_args_map[spec_cls])
+
+
+def test_cross_attention_spec_uses_max_source_positions():
+    spec = make_spec(CrossAttentionSpec)
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_encoder_input_tokens=2048),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(max_source_positions=6400)
+        ),
+    )
+
+    assert spec.max_memory_usage_bytes(vllm_config) == (
+        6400 // spec.block_size * spec.page_size_bytes
+    )
 
 
 def are_uniform_specs(*specs: KVCacheSpec) -> bool:

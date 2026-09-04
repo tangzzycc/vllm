@@ -574,6 +574,17 @@ def dummy_hf_overrides(
         if model_arch in ("Moondream3ForCausalLM", "HfMoondream"):
             hf_config.vision_config.update({"enc_n_layers": 1})
 
+    if (
+        model_arch == "CogAgentForCausalLM"
+        and getattr(hf_config, "cross_vision_config", None) is not None
+    ):
+        hf_config.cross_vision_config.update(
+            {
+                "num_layers": 1,
+                "num_hidden_layers": 1,
+            }
+        )
+
     # e.g.: ibm-granite/granite-speech-3.3-2b
     if hasattr(hf_config, "encoder_config"):
         hf_config.encoder_config.update(

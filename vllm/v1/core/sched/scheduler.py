@@ -959,7 +959,7 @@ class Scheduler(SchedulerInterface):
                     and encoder_inputs_to_schedule
                 ):
                     num_encoder_tokens = sum(
-                        request.get_num_encoder_embeds(i)
+                        request.get_num_cross_attention_tokens(i)
                         for i in encoder_inputs_to_schedule
                     )
 
@@ -1522,7 +1522,7 @@ class Scheduler(SchedulerInterface):
             mm_feature = mm_features[i]
             start_pos = mm_feature.mm_position.offset
             num_encoder_tokens = mm_feature.mm_position.length
-            num_encoder_embeds = mm_feature.mm_position.get_num_embeds()
+            num_encoder_embeds = mm_feature.get_num_encoder_output_tokens()
             item_identifier = mm_feature.identifier
 
             if self.is_encoder_decoder and num_computed_tokens > 0:
@@ -1640,7 +1640,7 @@ class Scheduler(SchedulerInterface):
             for input_id in input_ids:
                 mm_feature = request.mm_features[input_id]
                 stats.num_inputs += 1
-                stats.output_tokens += mm_feature.mm_position.get_num_embeds()
+                stats.output_tokens += mm_feature.get_num_encoder_output_tokens()
 
         return stats if stats.num_inputs else None
 

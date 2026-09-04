@@ -312,7 +312,11 @@ class Request:
 
     def get_num_encoder_embeds(self, input_id: int) -> int:
         assert input_id < len(self.mm_features)
-        return self.mm_features[input_id].mm_position.get_num_embeds()
+        return self.mm_features[input_id].get_num_encoder_output_tokens()
+
+    def get_num_cross_attention_tokens(self, input_id: int) -> int:
+        assert input_id < len(self.mm_features)
+        return self.mm_features[input_id].get_num_cross_attention_tokens()
 
     def record_event(
         self,

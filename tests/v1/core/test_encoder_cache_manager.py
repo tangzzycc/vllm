@@ -7,6 +7,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
+    compute_mm_encoder_budget,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -28,7 +29,7 @@ class MockRequest:
             self.mm_features.append(feature)
 
     def get_num_encoder_embeds(self, input_id: int) -> int:
-        return self._token_counts[input_id]
+        return self.mm_features[input_id].get_num_encoder_output_tokens()
 
 
 # ------------------ Unit Tests ------------------ #
@@ -365,3 +366,30 @@ def test_encoder_decoder_cache_manager_reset_allows_fresh_allocations():
 
     assert manager.num_free_slots == 2
     assert "img2" in manager.allocated
+
+
+def test_encoder_decoder_cache_uses_encoder_output_length():
+    manager = EncoderDecoderCacheManager(cache_size=6658)
+    request = MockRequest("req", ["image"], [258])
+    request.mm_features[0].encoder_output_seq_len = 6658
+
+    assert manager.can_allocate(request, 0, 6658, 0)
+    manager.allocate(request, 0)
+    assert manager.num_free_slots == 0
+
+
+def test_encoder_decoder_budget_is_independent_of_decoder_batch_size():
+    class SchedulerConfig:
+        disable_chunked_mm_input = True
+        max_num_batched_tokens = 2048
+        max_num_encoder_input_tokens = 2048
+        encoder_cache_size = 2048
+
+    compute_budget, cache_size = compute_mm_encoder_budget(
+        SchedulerConfig(),
+        {"image": 6658},
+        is_encoder_decoder=True,
+    )
+
+    assert compute_budget == 6658
+    assert cache_size == 6658

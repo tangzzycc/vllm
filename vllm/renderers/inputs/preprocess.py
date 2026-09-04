@@ -15,6 +15,7 @@ from vllm.inputs import (
     SingletonPrompt,
     TextPrompt,
     TokensPrompt,
+    split_enc_dec_input,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import is_list_of
@@ -275,4 +276,13 @@ def extract_prompt_len(
     return length_from_prompt_token_ids_or_embeds(
         target_prompt.get("prompt_token_ids"),
         target_prompt.get("prompt_embeds"),
+    )
+
+
+def extract_generation_prompt_len(prompt: EngineInput) -> int:
+    """Return the decoder-side prompt length used for generation limits."""
+    _, decoder_prompt = split_enc_dec_input(prompt)
+    return length_from_prompt_token_ids_or_embeds(
+        decoder_prompt.get("prompt_token_ids"),
+        decoder_prompt.get("prompt_embeds"),
     )

@@ -69,6 +69,28 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
 
 
 @pytest.mark.parametrize(
+    ("supports_rocm_cudagraph", "expected_enforce_eager"),
+    [(False, True), (True, False)],
+)
+def test_rocm_encoder_decoder_cudagraph_is_model_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    supports_rocm_cudagraph: bool,
+    expected_enforce_eager: bool,
+):
+    model_config = SimpleNamespace(
+        is_encoder_decoder=True,
+        enforce_eager=False,
+        _model_info=SimpleNamespace(supports_rocm_cudagraph=supports_rocm_cudagraph),
+        model_arch_config=SimpleNamespace(model_type="test"),
+    )
+    monkeypatch.setattr("vllm.config.model.current_platform.is_rocm", lambda: True)
+
+    ModelConfig._verify_cuda_graph(model_config)
+
+    assert model_config.enforce_eager is expected_enforce_eager
+
+
+@pytest.mark.parametrize(
     ("use_v2_model_runner", "expected_capture_sizes"),
     [
         (False, [4, 8, 12, 16]),

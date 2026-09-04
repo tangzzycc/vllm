@@ -1415,6 +1415,12 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         tokenizer_mode="mistral",
     ),
     # [Encoder-decoder]
+    "CogAgentForCausalLM": _HfExamplesInfo(
+        "zai-org/cogagent-chat-hf",
+        tokenizer="lmsys/vicuna-7b-v1.5",
+        dtype="bfloat16",
+        max_model_len=2048,
+    ),
     "CohereAsrForConditionalGeneration": _HfExamplesInfo(
         "CohereLabs/cohere-transcribe-03-2026", trust_remote_code=True
     ),

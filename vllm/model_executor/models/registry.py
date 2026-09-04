@@ -56,6 +56,7 @@ from .interfaces import (
     supports_multimodal_raw_input_only,
     supports_pp,
     supports_replayssm,
+    supports_rocm_cudagraph,
     supports_transcription,
 )
 from .interfaces_base import (
@@ -594,6 +595,7 @@ _MULTIMODAL_MODELS = {
     "VoxtralForConditionalGeneration": ("voxtral", "VoxtralForConditionalGeneration"),
     "VoxtralRealtimeGeneration": ("voxtral_realtime", "VoxtralRealtimeGeneration"),
     # [Encoder-decoder]
+    "CogAgentForCausalLM": ("cogagent", "CogAgentForCausalLM"),
     "CohereAsrForConditionalGeneration": (
         "cohere_asr",
         "CohereAsrForConditionalGeneration",
@@ -804,6 +806,7 @@ class _ModelInfo:
     supports_multimodal_raw_input_only: bool
     requires_raw_input_tokens: bool
     supports_multimodal_encoder_tp_data: bool
+    supports_rocm_cudagraph: bool
     supports_pp: bool
     has_inner_state: bool
     is_attention_free: bool
@@ -834,6 +837,7 @@ class _ModelInfo:
             supports_multimodal_encoder_tp_data=supports_multimodal_encoder_tp_data(
                 model
             ),
+            supports_rocm_cudagraph=supports_rocm_cudagraph(model),
             supports_pp=supports_pp(model),
             has_inner_state=has_inner_state(model),
             is_attention_free=is_attention_free(model),

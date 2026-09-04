@@ -4,10 +4,13 @@
 
 import json
 import tempfile
+from pathlib import Path
 
-from transformers import PretrainedConfig
+import pytest
+from transformers import LlamaConfig, PretrainedConfig
 
 from vllm.transformers_utils.config import _CONFIG_REGISTRY, get_config
+from vllm.transformers_utils.configs.cogagent import CogAgentConfig
 
 
 class _TestCustomConfig(PretrainedConfig):
@@ -79,3 +82,50 @@ def test_hf_overrides_model_type_returns_correct_config_class():
         from transformers import AutoConfig, MixtralConfig
 
         AutoConfig.register("mixtral", MixtralConfig, exist_ok=True)
+
+
+def test_hf_overrides_replaces_inferred_model_type():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_dict = {
+            "model_type": None,
+            "architectures": ["CogAgentForCausalLM"],
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "vocab_size": 100,
+        }
+        Path(tmpdir, "config.json").write_text(json.dumps(config_dict))
+
+        config = get_config(
+            tmpdir,
+            trust_remote_code=False,
+            hf_overrides_kw={"model_type": "llama"},
+        )
+
+    assert isinstance(config, LlamaConfig)
+    assert config.model_type == "llama"
+
+
+@pytest.mark.parametrize("explicit_null_model_type", [False, True])
+def test_model_type_is_inferred_from_known_architecture(
+    explicit_null_model_type: bool,
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_dict = {
+            "architectures": ["UnknownArchitecture", "CogAgentForCausalLM"],
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "vocab_size": 100,
+        }
+        if explicit_null_model_type:
+            config_dict["model_type"] = None
+        Path(tmpdir, "config.json").write_text(json.dumps(config_dict))
+
+        config = get_config(tmpdir, trust_remote_code=False)
+
+    assert isinstance(config, CogAgentConfig)
+    assert config.model_type == "cogagent"

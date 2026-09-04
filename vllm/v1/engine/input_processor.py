@@ -19,7 +19,8 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
-from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.multimodal.utils import argsort_mm_positions
 from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
@@ -187,7 +188,26 @@ class InputProcessor:
             or not self.lora_config.enable_tower_connector_lora
         ):
             return mm_hash
+
         return f"{lora_request.lora_name}:{mm_hash}"
+
+    def _get_mm_feature_seq_lens(
+        self,
+        modality: str,
+        mm_position: PlaceholderRange,
+    ) -> tuple[int | None, int | None]:
+        if not self.model_config.is_encoder_decoder:
+            return None, None
+
+        mm_processor = self.renderer.mm_processor
+        assert isinstance(mm_processor, EncDecMultiModalProcessor)
+        encoder_output_seq_len = mm_processor.get_encoder_output_seq_len(
+            modality, mm_position
+        )
+        cross_attention_seq_len = mm_processor.get_cross_attention_seq_len(
+            modality, mm_position
+        )
+        return encoder_output_seq_len, cross_attention_seq_len
 
     def inject_into_mm_cache(
         self,
@@ -364,6 +384,10 @@ class InputProcessor:
             mm_features = []
             for modality, idx in sorted_mm_idxs:
                 base_mm_hash = decoder_mm_hashes[modality][idx]
+                mm_position = decoder_mm_positions[modality][idx]
+                encoder_output_seq_len, cross_attention_seq_len = (
+                    self._get_mm_feature_seq_lens(modality, mm_position)
+                )
                 mm_features.append(
                     MultiModalFeatureSpec(
                         data=decoder_mm_inputs[modality][idx],
@@ -372,8 +396,10 @@ class InputProcessor:
                             base_mm_hash,
                             lora_request,
                         ),
-                        mm_position=decoder_mm_positions[modality][idx],
+                        mm_position=mm_position,
                         mm_hash=base_mm_hash,
+                        encoder_output_seq_len=encoder_output_seq_len,
+                        cross_attention_seq_len=cross_attention_seq_len,
                     )
                 )
 
@@ -466,11 +492,42 @@ class InputProcessor:
             decoder_mm_positions = prompt_input["mm_placeholders"]
             for modality, mm_positions in decoder_mm_positions.items():
                 for mm_position in mm_positions:
-                    num_embeds = mm_position.get_num_embeds()
-                    if num_embeds > self.mm_encoder_cache_size:
+                    num_decoder_embeds = mm_position.get_num_embeds()
+                    output_seq_len, cross_seq_len = self._get_mm_feature_seq_lens(
+                        modality, mm_position
+                    )
+                    num_encoder_embeds = (
+                        num_decoder_embeds if output_seq_len is None else output_seq_len
+                    )
+                    num_cross_attention_tokens = (
+                        num_encoder_embeds if cross_seq_len is None else cross_seq_len
+                    )
+                    if self.model_config.is_encoder_decoder:
+                        if (
+                            type(num_encoder_embeds) is not int
+                            or type(num_cross_attention_tokens) is not int
+                            or num_encoder_embeds <= 0
+                            or num_cross_attention_tokens <= 0
+                        ):
+                            raise VLLMValidationError(
+                                "Encoder output and cross-attention lengths must be "
+                                "positive"
+                            )
+                        if num_encoder_embeds < num_decoder_embeds:
+                            raise VLLMValidationError(
+                                "The encoder output cannot be shorter than the "
+                                "decoder-side multimodal embeddings"
+                            )
+                        if num_cross_attention_tokens > num_encoder_embeds:
+                            raise VLLMValidationError(
+                                "The cross-attention sequence cannot be longer "
+                                "than the encoder output"
+                            )
+                    if num_encoder_embeds > self.mm_encoder_cache_size:
                         raise VLLMValidationError(
                             f"The {prompt_type} prompt contains a(n) {modality} item "
-                            f"with {num_embeds} embedding tokens, which exceeds the "
+                            f"with {num_encoder_embeds} embedding tokens, which "
+                            "exceeds the "
                             f"pre-allocated encoder cache size "
                             f"{self.mm_encoder_cache_size}. Please reduce the input "
                             f"size or increase the encoder cache size "

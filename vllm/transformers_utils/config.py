@@ -76,6 +76,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     bagel="BagelConfig",
     umm="CheersConfig",
     chatglm="ChatGLMConfig",
+    cogagent="CogAgentConfig",
     modernvbert="ColModernVBertConfig",
     colpali="ColPaliConfig",
     colqwen3="ColQwen3Config",
@@ -137,6 +138,10 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
 )
 
 _SPECULATIVE_DECODING_CONFIGS: set[str] = {"eagle", "speculators", "medusa"}
+
+_CONFIG_ARCHITECTURE_ALIASES = {
+    "CogAgentForCausalLM": "cogagent",
+}
 
 _PATCH_HF_VALIDATE_ROPE: set[str] = {"sarvam_mla"}
 
@@ -259,12 +264,20 @@ class HFConfigParser(ConfigParserBase):
         )
         # Use custom model class if it's in our registry
         model_type = config_dict.get("model_type")
+        inferred_model_type = None
         if model_type is None:
-            model_type = (
-                "speculators"
-                if config_dict.get("speculators_config") is not None
-                else model_type
-            )
+            if config_dict.get("speculators_config") is not None:
+                model_type = "speculators"
+            elif architectures := config_dict.get("architectures"):
+                model_type = next(
+                    (
+                        _CONFIG_ARCHITECTURE_ALIASES[architecture]
+                        for architecture in architectures
+                        if architecture in _CONFIG_ARCHITECTURE_ALIASES
+                    ),
+                    None,
+                )
+                inferred_model_type = model_type
         # Allow hf_overrides to override model_type before checking _CONFIG_REGISTRY
         if (hf_overrides := kwargs.pop("hf_overrides", None)) is not None:
             if isinstance(hf_overrides, dict) and "model_type" in hf_overrides:
@@ -284,7 +297,15 @@ class HFConfigParser(ConfigParserBase):
         if extra_layer_types := _PATCH_HF_ALLOWED_LAYER_TYPES.get(model_type):
             _patch_hf_transformers_allowed_layer_types(extra_layer_types)
 
-        if model_type in _SPECULATIVE_DECODING_CONFIGS:
+        if inferred_model_type is not None:
+            inferred_config_dict = dict(config_dict)
+            inferred_config_dict.pop("model_type", None)
+            if model_type in _CONFIG_REGISTRY:
+                config_class = _CONFIG_REGISTRY[model_type]
+                config = config_class.from_dict(inferred_config_dict)
+            else:
+                config = AutoConfig.for_model(model_type, **inferred_config_dict)
+        elif model_type in _SPECULATIVE_DECODING_CONFIGS:
             config_class = _CONFIG_REGISTRY[model_type]
             config = config_class.from_pretrained(
                 model,

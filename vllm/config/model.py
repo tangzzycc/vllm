@@ -1318,7 +1318,9 @@ class ModelConfig:
 
     def _verify_cuda_graph(self) -> None:
         # CUDAGraph capture not supported for encoder-decoder models on ROCm
-        unsupported_rocm = self.is_encoder_decoder
+        unsupported_rocm = (
+            self.is_encoder_decoder and not self._model_info.supports_rocm_cudagraph
+        )
         if unsupported_rocm and not self.enforce_eager and current_platform.is_rocm():
             logger.warning(
                 "CUDA graph is not supported for %s on ROCm yet, fallback "

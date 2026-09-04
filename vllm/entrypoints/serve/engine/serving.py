@@ -19,8 +19,8 @@ from vllm.exceptions import VLLMNotFoundError
 from vllm.inputs import EngineInput
 from vllm.lora.request import LoRARequest
 from vllm.renderers.inputs.preprocess import (
+    extract_generation_prompt_len,
     extract_prompt_components,
-    extract_prompt_len,
 )
 from vllm.sampling_params import BeamSearchParams
 from vllm.utils import random_uuid
@@ -89,8 +89,8 @@ class BaseServing:
     def _extract_prompt_text(self, prompt: PromptType | EngineInput):
         return self._extract_prompt_components(prompt).text
 
-    def _extract_prompt_len(self, prompt: EngineInput):
-        return extract_prompt_len(self.model_config, prompt)
+    def _extract_prompt_len(self, prompt: EngineInput) -> int:
+        return extract_generation_prompt_len(prompt)
 
     def _log_inputs(
         self,

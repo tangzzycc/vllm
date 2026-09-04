@@ -60,6 +60,7 @@ def test_make_scheduled_encoder_input_stats_output_embeddings():
             modality="image",
             identifier="image-0",
             mm_position=PlaceholderRange(offset=0, length=196),
+            encoder_output_seq_len=256,
         ),
         MultiModalFeatureSpec(
             data=MultiModalKwargsItem.dummy(),
@@ -80,7 +81,7 @@ def test_make_scheduled_encoder_input_stats_output_embeddings():
 
     assert stats is not None
     assert stats.num_inputs == 3
-    assert stats.output_tokens == 441
+    assert stats.output_tokens == 501
 
 
 def test_scheduled_encoder_input_stats_disabled_without_iteration_logging(
@@ -4939,6 +4940,28 @@ def test_variable_length_cross_attn_block_allocation():
         "All requests have the same number of cross-attn blocks, "
         "suggesting static max-based allocation instead of per-request"
     )
+
+
+def test_cross_attn_block_allocation_uses_cross_attention_length():
+    block_size = 16
+    scheduler = _create_encoder_decoder_scheduler(block_size=block_size)
+    request = create_requests(
+        num_requests=1,
+        num_tokens=100,
+        mm_hashes_list=[["enc_hash"]],
+        mm_positions=[[PlaceholderRange(offset=0, length=3)]],
+        req_ids=["req"],
+    )[0]
+    assert request.mm_features is not None
+    feature = request.mm_features[0]
+    feature.encoder_output_seq_len = 23
+    feature.cross_attention_seq_len = 17
+
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+
+    assert len(output.scheduled_new_reqs) == 1
+    assert _get_num_cross_attn_blocks(scheduler, request.request_id) == 2
 
 
 def test_cross_attn_blocks_not_over_allocated():

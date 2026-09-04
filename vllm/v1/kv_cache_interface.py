@@ -775,7 +775,13 @@ class CrossAttentionSpec(AttentionSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         # For cross-attention, we need to cache encoder states
         # Get encoder length (e.g., 1500 for Whisper).
-        max_encoder_len = vllm_config.scheduler_config.max_num_encoder_input_tokens
+        max_source_positions = (
+            getattr(vllm_config.model_config.hf_config, "max_source_positions", 0) or 0
+        )
+        max_encoder_len = max(
+            vllm_config.scheduler_config.max_num_encoder_input_tokens,
+            max_source_positions,
+        )
         return cdiv(max_encoder_len, self.block_size) * self.page_size_bytes
 
 

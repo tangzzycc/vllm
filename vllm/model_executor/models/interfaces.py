@@ -155,6 +155,9 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
     `multimodal_config.mm_device_do_normalize`.
     """
 
+    supports_rocm_cudagraph: ClassVar[bool] = False
+    """A flag that allows ROCm CUDA graphs for this model."""
+
     requires_raw_input_tokens: ClassVar[bool] = False
     """
     A flag that indicates this model processes input id tokens
@@ -529,6 +532,10 @@ def supports_multimodal_embeddings(
 
 def supports_multimodal_raw_input_only(model: type[object] | object) -> bool:
     return getattr(model, "supports_multimodal_raw_input_only", False)
+
+
+def supports_rocm_cudagraph(model: type[object] | object) -> bool:
+    return getattr(model, "supports_rocm_cudagraph", False)
 
 
 def requires_raw_input_tokens(model: type[object] | object) -> bool:

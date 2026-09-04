@@ -1802,6 +1802,22 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 class EncDecMultiModalProcessor(BaseMultiModalProcessor[_I]):
     skip_decoder_start_token: bool = False
 
+    def get_encoder_output_seq_len(
+        self,
+        modality: str,
+        mm_position: PlaceholderRange,
+    ) -> int:
+        """Return the number of cached encoder-output embeddings for an item."""
+        return mm_position.get_num_embeds()
+
+    def get_cross_attention_seq_len(
+        self,
+        modality: str,
+        mm_position: PlaceholderRange,
+    ) -> int:
+        """Return the number of encoder tokens visible to cross-attention."""
+        return self.get_encoder_output_seq_len(modality, mm_position)
+
     @abstractmethod
     def create_encoder_prompt(
         self,
