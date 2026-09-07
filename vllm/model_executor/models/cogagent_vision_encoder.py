@@ -10,6 +10,10 @@ import torch
 import torch.nn as nn
 from einops import repeat
 
+from vllm.compilation.decorators import (
+    should_torch_compile_mm_encoder,
+    support_torch_compile,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import (
     get_act_fn,
@@ -474,6 +478,11 @@ class EVAAttention(nn.Module):
         return loaded_params
 
 
+@support_torch_compile(
+    dynamic_arg_dims={"x": 0},
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class EVALargeBlock(nn.Module):
     def __init__(
         self,
@@ -545,6 +554,11 @@ class EVALargeBlock(nn.Module):
         return x
 
 
+@support_torch_compile(
+    dynamic_arg_dims={"hidden_states": 0},
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
+)
 class EVATransformerLayer(nn.Module):
     def __init__(
         self,

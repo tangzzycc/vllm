@@ -325,11 +325,11 @@ def torch_sdpa_wrapper_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    scale: float | None,
-    cu_seqlens: torch.Tensor | None,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     enable_gqa: bool = False,
 ) -> torch.Tensor:
-    return torch.empty_like(q)
+    return torch.empty(q.shape, dtype=q.dtype, device=q.device)
 
 
 direct_register_custom_op(
