@@ -28,14 +28,203 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.cogagent import (
     EVACLIPVisionConfig,
     EVALargeVisionConfig,
 )
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 logger = init_logger(__name__)
 
 HAS_APEX = importlib.util.find_spec("apex")
+
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _eva_rope_qk_kernel(
+        q_ptr,
+        k_ptr,
+        cos_ptr,
+        sin_ptr,
+        q_out_ptr,
+        k_out_ptr,
+        stride_q_batch,
+        stride_q_token,
+        stride_q_hidden,
+        stride_k_batch,
+        stride_k_token,
+        stride_k_hidden,
+        stride_cos_token,
+        stride_cos_hidden,
+        stride_sin_token,
+        stride_sin_hidden,
+        NUM_TOKENS: tl.constexpr,
+        NUM_HEADS: tl.constexpr,
+        HIDDEN_SIZE: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row_idx = tl.program_id(0)
+        batch_idx = row_idx // NUM_TOKENS
+        token_idx = row_idx % NUM_TOKENS
+        hidden_offsets = tl.arange(0, BLOCK_SIZE)
+        mask = hidden_offsets < HIDDEN_SIZE
+
+        head_offsets = hidden_offsets % HEAD_DIM
+        paired_offsets = hidden_offsets + tl.where(head_offsets % 2 == 0, 1, -1)
+        q_offsets = (
+            batch_idx * stride_q_batch
+            + token_idx * stride_q_token
+            + hidden_offsets * stride_q_hidden
+        )
+        q_paired_offsets = (
+            batch_idx * stride_q_batch
+            + token_idx * stride_q_token
+            + paired_offsets * stride_q_hidden
+        )
+        k_offsets = (
+            batch_idx * stride_k_batch
+            + token_idx * stride_k_token
+            + hidden_offsets * stride_k_hidden
+        )
+        k_paired_offsets = (
+            batch_idx * stride_k_batch
+            + token_idx * stride_k_token
+            + paired_offsets * stride_k_hidden
+        )
+
+        rope_mask = mask & (token_idx > 0)
+        rope_offsets = (
+            token_idx - 1
+        ) * stride_cos_token + head_offsets * stride_cos_hidden
+        sin_offsets = (
+            token_idx - 1
+        ) * stride_sin_token + head_offsets * stride_sin_hidden
+        cos = tl.load(cos_ptr + rope_offsets, mask=rope_mask, other=1.0)
+        sin = tl.load(sin_ptr + sin_offsets, mask=rope_mask, other=0.0)
+
+        q = tl.load(q_ptr + q_offsets, mask=mask)
+        q_paired = tl.load(q_ptr + q_paired_offsets, mask=mask)
+        k = tl.load(k_ptr + k_offsets, mask=mask)
+        k_paired = tl.load(k_ptr + k_paired_offsets, mask=mask)
+        q_rotated = tl.where(head_offsets % 2 == 0, -q_paired, q_paired)
+        k_rotated = tl.where(head_offsets % 2 == 0, -k_paired, k_paired)
+
+        output_offsets = (
+            (batch_idx * NUM_HEADS + hidden_offsets // HEAD_DIM) * NUM_TOKENS
+            + token_idx
+        ) * HEAD_DIM + head_offsets
+        tl.store(q_out_ptr + output_offsets, q * cos + q_rotated * sin, mask=mask)
+        tl.store(k_out_ptr + output_offsets, k * cos + k_rotated * sin, mask=mask)
+
+
+def _apply_eva_rope_qk_native(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    output_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, num_tokens, _ = q.shape
+    q = q.reshape(batch_size, num_tokens, num_heads, head_dim).permute(0, 2, 1, 3)
+    k = k.reshape(batch_size, num_tokens, num_heads, head_dim).permute(0, 2, 1, 3)
+
+    q_tail = q[:, :, 1:, :]
+    k_tail = k[:, :, 1:, :]
+    q_tail = q_tail * freqs_cos + rotate_gptj(q_tail) * freqs_sin
+    k_tail = k_tail * freqs_cos + rotate_gptj(k_tail) * freqs_sin
+    q = torch.cat((q[:, :, :1, :], q_tail), dim=-2).to(output_dtype)
+    k = torch.cat((k[:, :, :1, :], k_tail), dim=-2).to(output_dtype)
+    return q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3)
+
+
+def _apply_eva_rope_qk_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    output_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, num_tokens, hidden_size = q.shape
+    # Preserve the native BHND backing layout for numerically stable attention.
+    q_out_storage = torch.empty(
+        (batch_size, num_heads, num_tokens, head_dim),
+        dtype=output_dtype,
+        device=q.device,
+    )
+    k_out_storage = torch.empty_like(q_out_storage)
+    block_size = triton.next_power_of_2(hidden_size)
+    num_warps = 8 if block_size >= 1024 else 4
+    _eva_rope_qk_kernel[(batch_size * num_tokens,)](
+        q,
+        k,
+        freqs_cos,
+        freqs_sin,
+        q_out_storage,
+        k_out_storage,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        freqs_cos.stride(0),
+        freqs_cos.stride(1),
+        freqs_sin.stride(0),
+        freqs_sin.stride(1),
+        num_tokens,
+        num_heads,
+        hidden_size,
+        head_dim,
+        block_size,
+        num_warps=num_warps,
+        # Match the native path's separate multiply and add operations.
+        enable_fp_fusion=False,
+    )
+    return q_out_storage.permute(0, 2, 1, 3), k_out_storage.permute(0, 2, 1, 3)
+
+
+def _apply_eva_rope_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    output_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    use_triton = (
+        HAS_TRITON
+        and current_platform.is_rocm()
+        and current_platform.is_gfx1151()
+        and q.is_cuda
+        and q.dtype in (torch.float16, torch.bfloat16)
+    )
+    if use_triton:
+        return _apply_eva_rope_qk_triton(
+            q,
+            k,
+            freqs_cos,
+            freqs_sin,
+            num_heads,
+            head_dim,
+            output_dtype,
+        )
+    return _apply_eva_rope_qk_native(
+        q,
+        k,
+        freqs_cos,
+        freqs_sin,
+        num_heads,
+        head_dim,
+        output_dtype,
+    )
 
 
 def sharded_weight_loader(
@@ -439,20 +628,15 @@ class EVAAttention(nn.Module):
             q, k, v = torch.chunk(qkv, 3, dim=-1)
 
         if self.use_rope:
-            # B, N, HD -> B, num_heads, N, C
-            q = q.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-            k = k.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-
-            # slightly fast impl
-            q_t = q[:, :, 1:, :]
-            ro_q_t = self.rope(q_t)
-            q = torch.cat((q[:, :, :1, :], ro_q_t), -2).type_as(v)
-            q = q.permute(0, 2, 1, 3)
-
-            k_t = k[:, :, 1:, :]
-            ro_k_t = self.rope(k_t)
-            k = torch.cat((k[:, :, :1, :], ro_k_t), -2).type_as(v)
-            k = k.permute(0, 2, 1, 3)
+            q, k = _apply_eva_rope_qk(
+                q,
+                k,
+                self.rope.freqs_cos,
+                self.rope.freqs_sin,
+                self.num_heads,
+                self.head_dim,
+                v.dtype,
+            )
 
         x = self.attn(q, k, v)
         if x.ndim == 4:
