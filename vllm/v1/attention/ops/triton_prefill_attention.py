@@ -26,11 +26,26 @@ It supports page size = 1.
 
 # Adapted from
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
+from typing import NamedTuple
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import RCP_LN2
+
+
+class _TritonPrefillAttentionConfig(NamedTuple):
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int = 1
+    waves_per_eu: int | None = None
+
+
+# Tuned across S=256..6401 on gfx115x. This avoids the CUDA-like 128x128
+# fallback selected for power-of-two head dimensions on these architectures.
+_GFX115X_D64_NON_CAUSAL_CONFIG = _TritonPrefillAttentionConfig(128, 32, 4)
 
 
 @triton.jit
@@ -283,6 +298,17 @@ def _is_rdna() -> bool:
         return False
 
 
+def _is_gfx115x() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx115x
+
+        return on_gfx115x()
+    except ImportError:
+        return False
+
+
 def get_block_size(dtype: torch.dtype, head_dim: int | None = None) -> int:
     """Query-tile size BLOCK_M (also the KV tile unless get_block_n differs)."""
     # SigLIP / Qwen3-VL ViT (head_dim=72) on gfx1151: with the split-D kernel
@@ -355,6 +381,23 @@ def get_waves_per_eu(head_dim: int) -> int | None:
     return None
 
 
+def _get_prefill_attention_config(
+    dtype: torch.dtype,
+    head_dim: int,
+    is_causal: bool,
+) -> _TritonPrefillAttentionConfig:
+    """Select the Triton prefill attention launch configuration."""
+    if _is_gfx115x() and dtype == torch.bfloat16 and head_dim == 64 and not is_causal:
+        return _GFX115X_D64_NON_CAUSAL_CONFIG
+
+    return _TritonPrefillAttentionConfig(
+        block_m=get_block_size(dtype, head_dim),
+        block_n=get_block_n(dtype, head_dim),
+        num_warps=get_num_warps(head_dim),
+        waves_per_eu=get_waves_per_eu(head_dim),
+    )
+
+
 def _split_head_dim(Lk: int) -> tuple[int, int]:
     """Pick (BLOCK_DMODEL, BLOCK_DMODEL_TAIL) covering head_dim ``Lk``.
 
@@ -393,8 +436,11 @@ def context_attention_fwd(
     """
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 
-    block_m = get_block_size(q.dtype, head_dim=Lk)
-    block_n = get_block_n(q.dtype, head_dim=Lk)
+    config = _get_prefill_attention_config(
+        q.dtype,
+        head_dim=Lk,
+        is_causal=is_causal,
+    )
 
     sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
     # rescale with 1/ln(2) for triton exp2
@@ -405,16 +451,14 @@ def context_attention_fwd(
     if sinks is not None:
         assert sinks.shape[0] == head, "Sinks must be num_query_heads size"
 
-    grid = (batch, head, triton.cdiv(max_input_len, block_m))
-    num_warps = get_num_warps(Lk)
+    grid = (batch, head, triton.cdiv(max_input_len, config.block_m))
 
     sliding_window_q = sliding_window_q if sliding_window_q is not None else 0
     sliding_window_k = sliding_window_k if sliding_window_k is not None else 0
 
-    waves_per_eu = get_waves_per_eu(Lk)
     extra_kwargs = {}
-    if waves_per_eu is not None:
-        extra_kwargs["waves_per_eu"] = waves_per_eu
+    if config.waves_per_eu is not None:
+        extra_kwargs["waves_per_eu"] = config.waves_per_eu
 
     block_dmodel, block_dmodel_tail = _split_head_dim(Lk)
 
@@ -447,16 +491,16 @@ def context_attention_fwd(
         o.stride(0),
         o.stride(1),
         kv_group_num=kv_group_num,
-        BLOCK_M=block_m,
+        BLOCK_M=config.block_m,
         BLOCK_DMODEL=block_dmodel,
         BLOCK_DMODEL_TAIL=block_dmodel_tail,
-        BLOCK_N=block_n,
+        BLOCK_N=config.block_n,
         IS_CAUSAL=is_causal,
         SLIDING_WINDOW_Q=sliding_window_q,
         SLIDING_WINDOW_K=sliding_window_k,
         USE_SINKS=sinks is not None,
-        num_warps=num_warps,
-        num_stages=1,
+        num_warps=config.num_warps,
+        num_stages=config.num_stages,
         Lk=Lk,
         HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
         **extra_kwargs,

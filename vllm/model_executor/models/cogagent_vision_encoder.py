@@ -22,6 +22,7 @@ from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.layernorm import LayerNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -38,6 +39,17 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 logger = init_logger(__name__)
 
 HAS_APEX = importlib.util.find_spec("apex")
+
+
+def _is_gfx115x() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    try:
+        from vllm.platforms.rocm import on_gfx115x
+
+        return on_gfx115x()
+    except ImportError:
+        return False
 
 
 if HAS_TRITON:
@@ -202,7 +214,7 @@ def _apply_eva_rope_qk(
     use_triton = (
         HAS_TRITON
         and current_platform.is_rocm()
-        and current_platform.is_gfx1151()
+        and _is_gfx115x()
         and q.is_cuda
         and q.dtype in (torch.float16, torch.bfloat16)
     )
@@ -237,7 +249,7 @@ def sharded_weight_loader(
     for name, loaded_weight in weights:
         shard_id = None
         if weights_mapper is not None and name in weights_mapper:
-            (hf_name, vlm_name, shard_id) = weights_mapper[name]
+            hf_name, vlm_name, shard_id = weights_mapper[name]
             name = name.replace(hf_name, vlm_name)
 
         param = params_dict[name]
@@ -284,9 +296,9 @@ def broadconcat(tensors, dim=-1):
     dim = (dim + shape_len) if dim < 0 else dim
     dims = list(zip(*map(lambda t: list(t.shape), tensors)))
     expandable_dims = [(i, val) for i, val in enumerate(dims) if i != dim]
-    assert all([*map(lambda t: len(set(t[1])) <= 2, expandable_dims)]), (
-        "invalid dimensions for broadcastable concatentation"
-    )
+    assert all(
+        [*map(lambda t: len(set(t[1])) <= 2, expandable_dims)]
+    ), "invalid dimensions for broadcastable concatentation"
     max_dims = list(map(lambda t: (t[0], max(t[1])), expandable_dims))
     expanded_dims = list(map(lambda t: (t[0], (t[1],) * num_tensors), max_dims))
     expanded_dims.insert(dim, (dim, dims[dim]))
@@ -433,15 +445,10 @@ class EVASwiGLU(nn.Module):
         layernorm = get_layernorm(layernorm_type)
         self.activation_fn = get_act_fn(config.mlp_hidden_act)
 
-        self.w1 = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            hidden_features,
-            prefix=f"{prefix}.w1",
-        )
-        self.w2 = ColumnParallelLinear(
-            config.hidden_size,
-            hidden_features,
-            prefix=f"{prefix}.w2",
+            [hidden_features, hidden_features],
+            prefix=f"{prefix}.gate_up_proj",
         )
 
         self.w3 = RowParallelLinear(
@@ -453,8 +460,8 @@ class EVASwiGLU(nn.Module):
         self.ffn_ln = layernorm(hidden_features, eps=config.layer_norm_eps)
 
     def forward(self, x):
-        gate, _ = self.w1(x)
-        up, _ = self.w2(x)
+        gate_up, _ = self.gate_up_proj(x)
+        gate, up = torch.chunk(gate_up, 2, dim=-1)
         hidden = self.activation_fn(gate) * up
 
         x = self.ffn_ln(hidden)
@@ -465,7 +472,12 @@ class EVASwiGLU(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params = sharded_weight_loader(params_dict, weights, {})
+        weights_mapper = {
+            f"{source}.{suffix}": (source, "gate_up_proj", shard_id)
+            for source, shard_id in (("w1", 0), ("w2", 1))
+            for suffix in ("weight", "bias")
+        }
+        loaded_params = sharded_weight_loader(params_dict, weights, weights_mapper)
 
         return loaded_params
 
@@ -561,24 +573,16 @@ class EVAAttention(nn.Module):
         self.scale = config.qk_scale
 
         if self.split_qkv:
-            self.q_proj = ColumnParallelLinear(
+            self.qkv_proj = QKVParallelLinear(
                 config.hidden_size,
-                config.hidden_size,
+                head_size=self.head_dim,
+                total_num_heads=self.num_heads,
                 bias=self.attn_bias,
-                prefix=f"{prefix}.q_proj",
+                prefix=f"{prefix}.qkv_proj",
             )
-            self.k_proj = ColumnParallelLinear(
-                config.hidden_size,
-                config.hidden_size,
-                bias=False,
-                prefix=f"{prefix}.k_proj",
-            )
-            self.v_proj = ColumnParallelLinear(
-                config.hidden_size,
-                config.hidden_size,
-                bias=self.attn_bias,
-                prefix=f"{prefix}.v_proj",
-            )
+            with torch.no_grad():
+                if self.qkv_proj.bias is not None:
+                    self.qkv_proj.bias.zero_()
         else:
             query_key_value = QKVParallelLinear(
                 config.hidden_size,
@@ -620,9 +624,8 @@ class EVAAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
         if self.split_qkv:
-            q, _ = self.q_proj(x)
-            k, _ = self.k_proj(x)
-            v, _ = self.v_proj(x)
+            qkv, _ = self.qkv_proj(x)
+            q, k, v = torch.chunk(qkv, 3, dim=-1)
         else:
             qkv, _ = getattr(self, self.attn_name)(x)
             q, k, v = torch.chunk(qkv, 3, dim=-1)
@@ -652,8 +655,11 @@ class EVAAttention(nn.Module):
         weights_mapper = {}
         if self.split_qkv:
             weights_mapper = {
-                "q_bias": ("q_bias", "q_proj.bias", None),
-                "v_bias": ("v_bias", "v_proj.bias", None),
+                "q_proj.weight": ("q_proj", "qkv_proj", "q"),
+                "k_proj.weight": ("k_proj", "qkv_proj", "k"),
+                "v_proj.weight": ("v_proj", "qkv_proj", "v"),
+                "q_bias": ("q_bias", "qkv_proj.bias", "q"),
+                "v_bias": ("v_bias", "qkv_proj.bias", "v"),
             }
 
         loaded_params = sharded_weight_loader(

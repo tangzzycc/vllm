@@ -5,10 +5,29 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import vllm.v1.attention.ops.triton_prefill_attention as prefill_attention
 from vllm.platforms import current_platform
-from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+from vllm.v1.attention.ops.triton_prefill_attention import (
+    _get_prefill_attention_config,
+    _TritonPrefillAttentionConfig,
+    context_attention_fwd,
+)
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_gfx115x_d64_non_causal_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(prefill_attention, "_is_gfx115x", lambda: True)
+
+    config = _get_prefill_attention_config(
+        torch.bfloat16,
+        head_dim=64,
+        is_causal=False,
+    )
+
+    assert config == _TritonPrefillAttentionConfig(128, 32, 4)
 
 
 def ref_masked_attention(

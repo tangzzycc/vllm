@@ -47,10 +47,8 @@ from vllm.utils.math_utils import RCP_LN2  # noqa: E402
 from vllm.v1.attention.backends.registry import AttentionBackendEnum  # noqa: E402
 from vllm.v1.attention.ops.triton_prefill_attention import (  # noqa: E402
     _fwd_kernel,
+    _get_prefill_attention_config,
     _split_head_dim,
-    get_block_n,
-    get_block_size,
-    get_num_warps,
 )
 
 _SUPPORTED_BACKENDS = [
@@ -108,9 +106,14 @@ def _bench_one(
 
     if backend == AttentionBackendEnum.TRITON_ATTN:
         # Keep direct kernel launch so tuning knobs are honoured.
-        BLOCK_M = args.bm if args.bm is not None else get_block_size(dtype, head_dim=D)
-        BLOCK_N = args.bn if args.bn is not None else get_block_n(dtype, head_dim=D)
-        num_warps = args.nw if args.nw is not None else get_num_warps(D)
+        default_config = _get_prefill_attention_config(
+            dtype,
+            head_dim=D,
+            is_causal=False,
+        )
+        BLOCK_M = args.bm if args.bm is not None else default_config.block_m
+        BLOCK_N = args.bn if args.bn is not None else default_config.block_n
+        num_warps = args.nw if args.nw is not None else default_config.num_warps
         BLOCK_DMODEL, BLOCK_DMODEL_TAIL = _split_head_dim(D)
         sm_scale = scale * RCP_LN2
         grid = (B, H, triton.cdiv(S, BLOCK_M))
@@ -130,14 +133,16 @@ def _bench_one(
         )
 
         extra_kwargs: dict = {}
-        if args.we is not None:
-            extra_kwargs["waves_per_eu"] = args.we
+        waves_per_eu = args.we if args.we is not None else default_config.waves_per_eu
+        if waves_per_eu is not None:
+            extra_kwargs["waves_per_eu"] = waves_per_eu
 
         def _fn():
             _fwd_kernel[grid](
                 q,
                 k,
                 v,
+                q,
                 sm_scale,
                 cu[:-1],
                 seqlen,
@@ -158,6 +163,7 @@ def _bench_one(
                 IS_CAUSAL=False,
                 SLIDING_WINDOW_Q=0,
                 SLIDING_WINDOW_K=0,
+                USE_SINKS=False,
                 num_warps=num_warps,
                 num_stages=args.ns,
                 Lk=D,
@@ -241,7 +247,7 @@ def _bench_one(
                 "BLOCK_N": BLOCK_N,
                 "num_warps": num_warps,
                 "num_stages": args.ns,
-                "waves_per_eu": args.we,
+                "waves_per_eu": waves_per_eu,
             }
         )
 
