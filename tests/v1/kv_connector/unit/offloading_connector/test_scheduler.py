@@ -30,7 +30,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    LookupWaitReason,
     OffloadingConnectorScheduler,
+    OffloadLookupResult,
     RequestOffloadState,
     get_sliding_window_size_in_chunks,
 )
@@ -59,6 +61,11 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.kv_offload.adaptive_policy import (
+    AdaptiveAction,
+    AdaptiveOffloadPolicy,
+    AdaptivePolicyConfig,
+)
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     LookupResult,
@@ -66,7 +73,9 @@ from vllm.v1.kv_offload.base import (
     OffloadingEvent,
     OffloadingKVEventsConfig,
     OffloadingManager,
+    OffloadKey,
     OffloadPolicy,
+    PendingLoadInfo,
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
@@ -204,9 +213,167 @@ def _make_partial_tail_request(
     request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(7)]
     request.all_token_ids = list(range(30))
     request.lora_request = None
+    request.skip_reading_prefix_cache = False
     request.is_finished.return_value = False
     scheduler.on_new_request(request)
     return request
+
+
+def _enable_adaptive(
+    scheduler: OffloadingConnectorScheduler,
+    **overrides,
+) -> None:
+    values = {
+        "mode": "enforce",
+        "prefill_tokens_per_second": 1_000_000.0,
+        "h2d_bandwidth_bytes_per_second": 1.0,
+        "safety_factor": 1.0,
+        "min_savings_ms": 0.0,
+        "min_recompute_tokens": 1,
+    }
+    values.update(overrides)
+    scheduler._adaptive_policy = AdaptiveOffloadPolicy(AdaptivePolicyConfig(**values))
+
+
+def test_adaptive_recompute_is_sticky_and_releases_on_finish():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    _enable_adaptive(scheduler)
+    scheduler._lookup_frontiers = MagicMock(return_value=OffloadLookupResult(16, 16))
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    state = scheduler._req_status[request.request_id]
+    assert state.adaptive_action is AdaptiveAction.RECOMPUTE
+    assert state.adaptive_bypass_until == 16
+    assert scheduler._adaptive_policy.active_tokens == 16
+
+    scheduler._lookup_frontiers.reset_mock()
+    assert scheduler.get_num_new_matched_tokens(request, 8) == (0, False)
+    scheduler._lookup_frontiers.assert_not_called()
+
+    scheduler.request_finished(request)
+    assert scheduler._adaptive_policy.active_requests == 0
+    assert scheduler._adaptive_policy.active_tokens == 0
+
+
+def test_adaptive_pending_hit_waits_when_load_is_cheaper():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    _enable_adaptive(
+        scheduler,
+        prefill_tokens_per_second=1.0,
+        h2d_bandwidth_bytes_per_second=1_000_000_000.0,
+        secondary_bandwidth_bytes_per_second={"fs": 1_000_000_000.0},
+    )
+    pending_key = to_keys([99])[0]
+    scheduler._lookup_frontiers = MagicMock(
+        return_value=OffloadLookupResult(
+            0,
+            16,
+            LookupWaitReason.PROMOTION,
+            pending_keys=(pending_key,),
+        )
+    )
+    scheduler.manager.get_pending_load_info.return_value = PendingLoadInfo(
+        tier_idx=0,
+        tier_type="fs",
+        num_bytes=1,
+        queued_bytes=0,
+        elapsed_seconds=0.0,
+        waiter_count=1,
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert scheduler._adaptive_policy.active_requests == 0
+    scheduler.manager.detach_pending_load.assert_not_called()
+
+
+def test_adaptive_loads_ready_prefix_and_recomputes_pending_tail():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    _enable_adaptive(
+        scheduler,
+        prefill_tokens_per_second=1_000.0,
+        h2d_bandwidth_bytes_per_second=1_000_000_000.0,
+        secondary_bandwidth_bytes_per_second={"fs": 1.0},
+    )
+    pending_key = to_keys([99])[0]
+    scheduler._lookup_frontiers = MagicMock(
+        return_value=OffloadLookupResult(
+            8,
+            16,
+            LookupWaitReason.PROMOTION,
+            pending_keys=(pending_key,),
+            ready_partial_tail_boundary=8,
+        )
+    )
+    scheduler.manager.get_pending_load_info.return_value = PendingLoadInfo(
+        tier_idx=0,
+        tier_type="fs",
+        num_bytes=1024,
+        queued_bytes=0,
+        elapsed_seconds=0.0,
+        waiter_count=1,
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (8, True)
+    state = scheduler._req_status[request.request_id]
+    assert state.adaptive_action is AdaptiveAction.LOAD_READY
+    assert state.adaptive_bypass_until == 16
+    assert state.adaptive_reserved_tokens == 8
+    scheduler.manager.detach_pending_load.assert_called_once_with(
+        (pending_key,), state.req_context
+    )
+
+
+def test_adaptive_admission_rejection_falls_back_to_load():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    _enable_adaptive(scheduler, max_active_recompute_requests=1)
+    assert scheduler._adaptive_policy.reserve(1)
+    scheduler._lookup_frontiers = MagicMock(return_value=OffloadLookupResult(16, 16))
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    reduced = scheduler._connector_stats.reduce()
+    key = (
+        f"{_ConnectorMetricName.ADAPTIVE_ADMISSION_REJECTION}:('max_active_requests',)"
+    )
+    assert reduced[key] == 1
+    scheduler.manager.detach_pending_load.assert_not_called()
+
+
+def test_adaptive_observe_records_recompute_but_keeps_load_behavior():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    _enable_adaptive(scheduler, mode="observe")
+    scheduler._lookup_frontiers = MagicMock(return_value=OffloadLookupResult(16, 16))
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    assert scheduler._adaptive_policy.active_requests == 0
+    reduced = scheduler._connector_stats.reduce()
+    key = (
+        f"{_ConnectorMetricName.ADAPTIVE_DECISION}:"
+        "('observe', 'recompute', 'lower_cost')"
+    )
+    assert reduced[key] == 1
+
+
+def test_adaptive_reset_releases_all_recompute_budget():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    _enable_adaptive(scheduler)
+    scheduler._lookup_frontiers = MagicMock(return_value=OffloadLookupResult(16, 16))
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler._adaptive_policy.active_tokens == 16
+
+    scheduler.reset_cache()
+
+    assert scheduler._adaptive_policy.active_requests == 0
+    assert scheduler._adaptive_policy.active_tokens == 0
+    state = scheduler._req_status[request.request_id]
+    assert state.adaptive_bypass_until == 0
+    assert state.adaptive_reserved_tokens == 0
 
 
 def _reduce_kv_connector_stats(runner):
@@ -1537,6 +1704,48 @@ def _maximal_lookup(sched, keys, start_chunk_idx: int = 0):
         _LOOKUP_REQ,
         _LOOKUP_GROUP_CONFIG,
         start_chunk_idx,
+    )
+
+
+def test_prefix_lookup_frontiers_share_one_lookup_snapshot():
+    keys = to_keys([1, 2, 3])
+    sched = _make_scheduler_with_lookup(
+        {
+            1: LookupResult.HIT,
+            2: LookupResult.HIT_PENDING,
+            3: LookupResult.HIT,
+        }
+    )
+    cache: dict[OffloadKey, LookupResult] = {}
+
+    candidate = sched._maximal_prefix_lookup_mode(
+        keys,
+        _EMPTY_REQ_CTX,
+        _LOOKUP_REQ,
+        _LOOKUP_GROUP_CONFIG,
+        0,
+        lookup_cache=cache,
+        include_pending=True,
+    )
+    ready = sched._maximal_prefix_lookup_mode(
+        keys,
+        _EMPTY_REQ_CTX,
+        _LOOKUP_REQ,
+        _LOOKUP_GROUP_CONFIG,
+        0,
+        lookup_cache=cache,
+        include_pending=False,
+    )
+
+    assert (ready, candidate) == (1, 3)
+    assert sched.manager.lookup.call_count == 3
+
+
+def test_lookup_result_records_distinct_wait_reasons():
+    assert OffloadLookupResult(0, 0).wait_reason is LookupWaitReason.NONE
+    assert (
+        OffloadLookupResult(0, 1, LookupWaitReason.PROMOTION).wait_reason
+        is LookupWaitReason.PROMOTION
     )
 
 

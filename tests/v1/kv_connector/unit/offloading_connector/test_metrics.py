@@ -75,6 +75,19 @@ def test_connector_metric_histogram_buckets():
         10,
     )
 
+    adaptive_decision = metadata[_ConnectorMetricName.ADAPTIVE_DECISION]
+    assert isinstance(adaptive_decision, OffloadingCounterMetadata)
+    assert adaptive_decision.labelnames == ("mode", "action", "reason")
+
+    for name in (
+        _ConnectorMetricName.ADAPTIVE_WAIT_SECONDS,
+        _ConnectorMetricName.ADAPTIVE_SELECTED_SECONDS,
+        _ConnectorMetricName.ADAPTIVE_RECOMPUTE_TOKENS,
+    ):
+        adaptive_histogram = metadata[name]
+        assert isinstance(adaptive_histogram, OffloadingHistogramMetadata)
+        assert adaptive_histogram.labelnames == ("action",)
+
 
 class _FakeMetric:
     def __init__(self, **kwargs):

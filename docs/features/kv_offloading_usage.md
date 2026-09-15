@@ -66,6 +66,76 @@ vllm serve <model> \
   }'
 ```
 
+## Adaptive Load Versus Recompute
+
+The optional `adaptive_load` policy compares the estimated time to restore an
+offloaded prefix with the estimated time to recompute it. It makes the choice
+before GPU blocks are allocated and before a CPU-to-GPU load is submitted.
+
+For a prefix already in the CPU tier, the policy chooses between loading the
+full prefix and recomputing it. For a secondary-tier hit being promoted to
+CPU, it can wait and load the full prefix (`wait_full`), load the part already
+ready in CPU and recompute the pending tail (`load_ready`), or recompute the
+full external prefix (`recompute`). The recompute choices require enough
+estimated savings after applying the safety margin, and admission limits cap
+their concurrent prefill work.
+
+```bash
+vllm serve <model> \
+  --kv-transfer-config '{
+    "kv_connector": "OffloadingConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "spec_name": "TieringOffloadingSpec",
+      "cpu_bytes_to_use": 10737418240,
+      "secondary_tiers": [
+        {"type": "fs", "root_dir": "/mnt/kv_cache"}
+      ],
+      "adaptive_load": {
+        "mode": "enforce",
+        "prefill_tokens_per_second": 12000,
+        "h2d_bandwidth_bytes_per_second": 20000000000,
+        "secondary_bandwidth_bytes_per_second": {"fs": 3000000000},
+        "safety_factor": 1.15,
+        "min_savings_ms": 2,
+        "min_recompute_tokens": 256,
+        "max_recompute_tokens_per_request": 8192,
+        "max_active_recompute_requests": 2,
+        "max_active_recompute_tokens": 8192
+      }
+    }
+  }'
+```
+
+Set `mode` to `observe` to emit decisions and cost metrics while retaining the
+normal load behavior. Set it to `enforce` to apply decisions;
+`prefill_tokens_per_second` is required in this mode. Bandwidth values seed the
+estimators during startup. Measured throughput replaces a seed after enough
+completed transfer samples are available.
+
+An already submitted secondary-to-CPU promotion is not cancelled when a
+request chooses recomputation. The request detaches as a waiter while the
+promotion continues concurrently, allowing a later request to reuse the CPU
+copy. The connector does not write KV through CPU-to-GPU DMA concurrently
+with recomputation into the same GPU blocks. `load_ready` uses disjoint prefix
+and tail ranges, and transfers for other requests can still overlap model work.
+
+| Key | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `mode` | no | `off` | `off`, `observe`, or `enforce`. |
+| `prefill_tokens_per_second` | enforce only | — | Measured prefill throughput used to estimate recomputation time. |
+| `prefill_fixed_ms` | no | `0` | Fixed prefill cost added to each recompute estimate. |
+| `h2d_bandwidth_bytes_per_second` | no | — | Startup estimate for CPU-to-GPU bandwidth. |
+| `secondary_bandwidth_bytes_per_second` | no | `{}` | Startup bandwidth by tier type, for example `{"fs": 3e9}`. |
+| `min_transfer_samples` | no | `8` | Samples required before measured bandwidth replaces a seed. |
+| `estimator_window` | no | `64` | Number of recent transfer observations retained. |
+| `safety_factor` | no | `1.15` | Multiplier applied to an alternative before it may beat loading. |
+| `min_savings_ms` | no | `2` | Additional required estimated saving. |
+| `min_recompute_tokens` | no | `256` | Smallest recompute segment eligible for admission. |
+| `max_recompute_tokens_per_request` | no | `8192` | Largest recompute segment; `null` disables this limit. |
+| `max_active_recompute_requests` | no | `2` | Concurrent requests admitted to adaptive recomputation. |
+| `max_active_recompute_tokens` | no | `8192` | Total tokens reserved by active adaptive recomputations. |
+
 ## `kv_connector_extra_config` Reference
 
 | Key | Required | Default | Scope | Notes |
@@ -80,6 +150,7 @@ vllm serve <model> \
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
 | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |
+| `adaptive_load` | no | `{"mode": "off"}` | both | Cost policy for loading or recomputing offloaded prefixes. See [Adaptive Load Versus Recompute](#adaptive-load-versus-recompute). |
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Partial recurrent tails emit the hash-aligned portion from the physical block start through the tail boundary. Other sliding-window/SSM chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |
 | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |
 

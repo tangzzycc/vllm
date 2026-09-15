@@ -855,6 +855,78 @@ class TestTieringOffloadingManager:
         assert list(job_metadata.keys) == [shared_chunk]
         assert job_metadata.req_context is ctx_a
 
+    def test_pending_promotion_reports_cost_and_tracks_waiters(self, manager_setup):
+        shared_chunk = to_keys([0])[0]
+        self.secondary_tier1.chunks[shared_chunk] = True
+        ctx_a = ReqContext(req_id="req_a")
+        ctx_b = ReqContext(req_id="req_b")
+
+        assert self.manager.lookup(shared_chunk, ctx_a) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(shared_chunk, ctx_b) is LookupResult.HIT_PENDING
+
+        info = self.manager.get_pending_load_info([shared_chunk], ctx_a)
+        assert info is not None
+        assert info.tier_idx == 0
+        assert info.tier_type == "example"
+        assert info.num_bytes == self.manager._primary_chunk_size
+        assert info.queued_bytes == 0
+        assert info.waiter_count == 2
+
+    def test_pending_promotion_reports_only_earlier_queued_jobs(self, manager_setup):
+        first, second = to_keys([0, 1])
+        self.secondary_tier1.chunks[first] = True
+        self.secondary_tier1.chunks[second] = True
+        ctx_a = ReqContext(req_id="req_a")
+        ctx_b = ReqContext(req_id="req_b")
+
+        assert self.manager.lookup(first, ctx_a) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(second, ctx_b) is LookupResult.HIT_PENDING
+        self._simulate_on_schedule_end()
+
+        first_info = self.manager.get_pending_load_info([first], ctx_a)
+        second_info = self.manager.get_pending_load_info([second], ctx_b)
+        assert first_info is not None
+        assert second_info is not None
+        assert first_info.queued_bytes == 0
+        assert second_info.queued_bytes == self.manager._primary_chunk_size
+
+    def test_detaching_last_waiter_does_not_cancel_promotion(self, manager_setup):
+        shared_chunk = to_keys([0])[0]
+        self.secondary_tier1.chunks[shared_chunk] = True
+        self.secondary_tier1.submit_load = MagicMock(
+            wraps=self.secondary_tier1.submit_load
+        )
+        ctx_a = ReqContext(req_id="req_a")
+        ctx_b = ReqContext(req_id="req_b")
+
+        assert self.manager.lookup(shared_chunk, ctx_a) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(shared_chunk, ctx_b) is LookupResult.HIT_PENDING
+        self.manager.detach_pending_load([shared_chunk], ctx_a)
+        assert self.manager._active_promotions[shared_chunk].waiters == {"req_b"}
+        self.manager.detach_pending_load([shared_chunk], ctx_b)
+        assert not self.manager._active_promotions[shared_chunk].waiters
+
+        self._simulate_on_schedule_end()
+        self.secondary_tier1.submit_load.assert_called_once()
+        assert shared_chunk in self.manager._active_promotions
+
+        self.manager._process_finished_jobs()
+        assert shared_chunk not in self.manager._active_promotions
+
+    def test_reset_cache_clears_promotion_cost_state(self, manager_setup):
+        shared_chunk = to_keys([0])[0]
+        self.secondary_tier1.chunks[shared_chunk] = True
+        ctx = ReqContext(req_id="req")
+
+        assert self.manager.lookup(shared_chunk, ctx) is LookupResult.HIT_PENDING
+        self.manager._promotion_estimators[0].record(100, 1.0)
+        assert self.manager._active_promotions
+
+        self.manager.reset_cache()
+
+        assert not self.manager._active_promotions
+        assert len(self.manager._promotion_estimators[0]) == 0
+
     def test_complete_store_forwards_req_context_to_submit_store(self, manager_setup):
         """complete_store cascades to secondary tiers with the correct req_context."""
         chunks = to_keys(range(2))
