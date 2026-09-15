@@ -28,6 +28,19 @@ def test_config_requires_prefill_rate_when_enforced():
         AdaptivePolicyConfig.from_extra_config({"adaptive_load": {"mode": "enforce"}})
 
 
+def test_config_parses_recompute_window_budget():
+    config = AdaptivePolicyConfig.from_extra_config(
+        {
+            "adaptive_load": {
+                "recompute_window_seconds": 5,
+                "max_recompute_tokens_per_window": 1024,
+            }
+        }
+    )
+    assert config.recompute_window_seconds == 5
+    assert config.max_recompute_tokens_per_window == 1024
+
+
 def test_policy_loads_cpu_ready_prefix_when_h2d_is_cheaper():
     decision = _policy().decide(
         ready_tokens=100,
@@ -96,6 +109,45 @@ def test_recompute_admission_uses_request_and_token_budgets():
     policy.release(100)
     assert policy.active_requests == 0
     assert policy.active_tokens == 0
+
+
+def test_recompute_window_budget_survives_active_release(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.adaptive_policy.time.monotonic", lambda: now[0]
+    )
+    policy = _policy(
+        max_active_recompute_requests=2,
+        max_active_recompute_tokens=200,
+        recompute_window_seconds=10.0,
+        max_recompute_tokens_per_window=100,
+    )
+
+    assert policy.reserve(80)
+    policy.release(80)
+    assert policy.capacity_reason(21) == "max_window_tokens"
+    assert policy.reserve(20)
+    policy.release(20)
+
+    now[0] = 110.1
+    assert policy.reserve(100)
+    policy.reset()
+    assert policy.reserve(100)
+
+
+def test_recompute_window_budget_can_rollback_failed_admission():
+    policy = _policy(
+        max_active_recompute_requests=1,
+        max_active_recompute_tokens=100,
+        max_recompute_tokens_per_window=100,
+    )
+
+    assert policy.reserve(100)
+    policy.rollback_reservation(100)
+
+    assert policy.active_requests == 0
+    assert policy.active_tokens == 0
+    assert policy.reserve(100)
 
 
 def test_transfer_estimator_uses_seed_until_enough_samples():

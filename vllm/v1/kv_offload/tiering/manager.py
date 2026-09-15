@@ -74,6 +74,7 @@ class PendingPromotion:
 class PromotionState:
     tier_idx: int
     created_at: float
+    request_id: str
     waiters: set[str]
     submitted_at: float | None = None
     job_id: JobId | None = None
@@ -485,6 +486,7 @@ class TieringOffloadingManager(OffloadingManager):
             self._active_promotions[promoted_key] = PromotionState(
                 tier_idx=tier_idx,
                 created_at=created_at,
+                request_id=req_context.req_id,
                 waiters={req_context.req_id},
             )
         # Defer submit_load to on_schedule_end(). Group by (tier, request) so
@@ -512,17 +514,38 @@ class TieringOffloadingManager(OffloadingManager):
         for tier_idx, pending_by_ctx in self._pending_load_submissions.items():
             tier = self.secondary_tiers[tier_idx]
             for entry in pending_by_ctx.values():
+                keys = []
+                chunk_ids = []
+                detached_keys = []
+                for key, chunk_id in zip(entry.keys, entry.chunk_ids):
+                    if self._active_promotions[key].waiters:
+                        keys.append(key)
+                        chunk_ids.append(chunk_id)
+                    else:
+                        detached_keys.append(key)
+
+                if detached_keys:
+                    self.primary_tier.complete_write(
+                        detached_keys,
+                        entry.req_context,
+                        False,
+                    )
+                    for key in detached_keys:
+                        self._active_promotions.pop(key)
+                if not keys:
+                    continue
+
                 job_id = self._next_job_id()
                 job_metadata = TransferJob(
                     job_id=job_id,
-                    keys=entry.keys,
-                    chunk_ids=np.array(entry.chunk_ids, dtype=np.int32),
+                    keys=keys,
+                    chunk_ids=np.array(chunk_ids, dtype=np.int32),
                     is_promotion=True,
                     req_context=entry.req_context,
                 )
                 self._register_job(job_metadata, tier_idx)
                 submitted_at = time.monotonic()
-                for key in entry.keys:
+                for key in keys:
                     promotion = self._active_promotions[key]
                     promotion.submitted_at = submitted_at
                     promotion.job_id = job_id
@@ -562,27 +585,31 @@ class TieringOffloadingManager(OffloadingManager):
             else None
         )
         first_created = min(state.created_at for state in promotions)
-        queued_keys = {
-            key
-            for key, state in self._active_promotions.items()
-            if state.tier_idx == tier_idx
-            and key not in requested_keys
-            and state.job_id not in requested_jobs
-            and (
-                (
-                    first_submitted is None
-                    and (
-                        state.submitted_at is not None
-                        or state.created_at < first_created
-                    )
-                )
-                or (
-                    first_submitted is not None
-                    and state.submitted_at is not None
-                    and state.submitted_at <= first_submitted
-                )
+        queued_jobs: dict[tuple[str, int | str], int] = {}
+        for key, state in self._active_promotions.items():
+            if (
+                state.tier_idx != tier_idx
+                or key in requested_keys
+                or state.job_id in requested_jobs
+            ):
+                continue
+            is_earlier = (
+                first_submitted is None
+                and (state.submitted_at is not None or state.created_at < first_created)
+            ) or (
+                first_submitted is not None
+                and state.submitted_at is not None
+                and state.submitted_at <= first_submitted
             )
-        }
+            if not is_earlier:
+                continue
+            group = (
+                ("job", state.job_id)
+                if state.job_id is not None
+                else ("request", state.request_id)
+            )
+            queued_jobs[group] = queued_jobs.get(group, 0) + self._primary_chunk_size
+        queued_job_bytes = tuple(queued_jobs.values())
         elapsed_seconds = (
             max(0.0, time.monotonic() - first_submitted)
             if first_submitted is not None
@@ -592,12 +619,14 @@ class TieringOffloadingManager(OffloadingManager):
             tier_idx=tier_idx,
             tier_type=self.secondary_tiers[tier_idx].tier_type,
             num_bytes=len(promotions) * self._primary_chunk_size,
-            queued_bytes=len(queued_keys) * self._primary_chunk_size,
+            queued_bytes=sum(queued_job_bytes),
+            queued_job_bytes=queued_job_bytes,
             elapsed_seconds=elapsed_seconds,
             waiter_count=len(set().union(*(state.waiters for state in promotions))),
             bandwidth_bytes_per_second=self._promotion_estimators[
                 tier_idx
             ].bytes_per_second,
+            load_parallelism=self.secondary_tiers[tier_idx].load_parallelism,
         )
 
     @override
@@ -605,11 +634,45 @@ class TieringOffloadingManager(OffloadingManager):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
-    ) -> None:
-        for key in keys:
+    ) -> bool:
+        requested_keys = set(keys)
+        detached_keys: set[OffloadKey] = set()
+        job_ids: set[JobId] = set()
+        for key in requested_keys:
             promotion = self._active_promotions.get(key)
-            if promotion is not None:
-                promotion.waiters.discard(req_context.req_id)
+            if promotion is None or req_context.req_id not in promotion.waiters:
+                continue
+            promotion.waiters.remove(req_context.req_id)
+            detached_keys.add(key)
+            if promotion.job_id is not None:
+                job_ids.add(promotion.job_id)
+
+        for job_id in job_ids:
+            job_metadata = self._jobs.get(job_id)
+            assert job_metadata is not None
+            transfer_job = job_metadata.transfer_job
+            promotions = [self._active_promotions[key] for key in transfer_job.keys]
+            if any(promotion.waiters for promotion in promotions):
+                continue
+
+            tier = self.secondary_tiers[job_metadata.tier_idx]
+            if not tier.cancel_load(job_id):
+                for key in detached_keys:
+                    promotion = self._active_promotions.get(key)
+                    if promotion is not None:
+                        promotion.waiters.add(req_context.req_id)
+                return False
+
+            assert self._pop_job(job_id) is job_metadata
+            self._metrics.on_job_cancelled(job_metadata)
+            self.primary_tier.complete_write(
+                transfer_job.keys,
+                transfer_job.req_context,
+                False,
+            )
+            for key in transfer_job.keys:
+                self._active_promotions.pop(key)
+        return True
 
     @override
     def prepare_load(

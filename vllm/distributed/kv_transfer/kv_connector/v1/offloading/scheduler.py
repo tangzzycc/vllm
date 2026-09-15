@@ -694,13 +694,21 @@ class OffloadingConnectorScheduler:
                 labelvalues=(reason,),
             )
             return False
+        if result.pending_keys and not self.manager.detach_pending_load(
+            result.pending_keys, req_status.req_context
+        ):
+            self._adaptive_policy.rollback_reservation(recompute_tokens)
+            self._connector_stats.increase_counter(
+                _ConnectorMetricName.ADAPTIVE_ADMISSION_REJECTION,
+                labelvalues=("promotion_in_flight",),
+            )
+            return False
         self._record_adaptive_budget_gauges()
         req_status.adaptive_bypass_until = (
             req_status.num_locally_computed_tokens + result.candidate_tokens
         )
         req_status.adaptive_reserved_tokens = recompute_tokens
         req_status.adaptive_action = action
-        self.manager.detach_pending_load(result.pending_keys, req_status.req_context)
         return True
 
     def _record_adaptive_budget_gauges(self) -> None:
@@ -767,7 +775,16 @@ class OffloadingConnectorScheduler:
             bandwidth = configured.get(pending.tier_type)
         if bandwidth is None or bandwidth <= 0:
             return None
-        estimated = (pending.num_bytes + pending.queued_bytes) / bandwidth
+        parallelism = max(1, pending.load_parallelism)
+        estimated = pending.num_bytes / bandwidth
+        worker_backlogs = [0] * parallelism
+        for num_bytes in pending.queued_job_bytes:
+            worker_idx = min(range(parallelism), key=worker_backlogs.__getitem__)
+            worker_backlogs[worker_idx] += num_bytes
+        if pending.queued_job_bytes:
+            estimated += min(worker_backlogs) / bandwidth
+        else:
+            estimated += pending.queued_bytes / (bandwidth * parallelism)
         return max(0.0, estimated - pending.elapsed_seconds)
 
     def _apply_adaptive_policy(

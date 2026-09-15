@@ -259,6 +259,11 @@ def test_store_then_load_roundtrip(fs_tier):
     ]
 
 
+def test_load_parallelism_includes_both_worker_groups(fs_tier):
+    tier, _ = fs_tier
+    assert tier.load_parallelism == 8
+
+
 def test_invalid_path_raises_at_construction():
     """Construction must fail immediately when the config file cannot be written."""
     tensor = _page_aligned_zero_tensor(32, _BLOCK_ELEMENTS)
@@ -463,6 +468,73 @@ def test_wait_idle_blocks_until_tasks_complete():
         gate.set()
         pool.shutdown(wait=True)
         waiter.join(timeout=5.0)
+
+
+def test_cancel_load_only_removes_job_that_has_not_started():
+    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=0)
+    gate = threading.Event()
+    started = threading.Event()
+    cancelled_task_ran = threading.Event()
+
+    def blocking_task():
+        started.set()
+        gate.wait(timeout=5.0)
+
+    pool.enqueue_load(job_id=1, n_tasks=1, tasks=[blocking_task])
+    assert started.wait(timeout=5.0)
+    pool.enqueue_load(job_id=2, n_tasks=1, tasks=[cancelled_task_ran.set])
+
+    try:
+        assert not pool.cancel_load(1)
+        assert pool.cancel_load(2)
+        gate.set()
+        pool.wait_idle()
+
+        assert not cancelled_task_ran.is_set()
+        assert [job_id for job_id, _, _ in pool.get_finished()] == [1]
+    finally:
+        gate.set()
+        pool.shutdown(wait=True)
+
+
+def test_fs_cancel_load_cleans_queued_job(tmp_path, monkeypatch):
+    tensor = _page_aligned_zero_tensor(2, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=1,
+        n_write_threads=0,
+    )
+    gate = threading.Event()
+    started = threading.Event()
+    loaded_paths: list[str] = []
+
+    def blocking_load(paths, *args):
+        loaded_paths.extend(paths)
+        started.set()
+        gate.wait(timeout=5.0)
+
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.tiering.fs.manager.batch_load_block", blocking_load
+    )
+    tier.submit_load(make_job(1, [key(1)], [0], is_promotion=True))
+    assert started.wait(timeout=5.0)
+    tier.submit_load(make_job(2, [key(2)], [1], is_promotion=True))
+
+    try:
+        assert tier.cancel_load(2)
+        gate.set()
+        results = drain(tier)
+
+        assert [result.job_id for result in results] == [1]
+        assert len(loaded_paths) == 1
+        assert 2 not in tier._load_job_keys
+        assert 2 not in tier._load_progress
+    finally:
+        gate.set()
+        tier.shutdown()
 
 
 def test_batch_lookup_c_extension(tmp_path):

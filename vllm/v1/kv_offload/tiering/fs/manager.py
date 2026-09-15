@@ -135,6 +135,7 @@ class FileSystemTierManager(SecondaryTierManager):
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
+        self._load_parallelism = n_read_threads + n_write_threads
 
         self.events: list[OffloadingEvent] | None = None
         if enable_kv_events:
@@ -203,6 +204,10 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+    @property
+    def load_parallelism(self) -> int:
+        return self._load_parallelism
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -267,6 +272,14 @@ class FileSystemTierManager(SecondaryTierManager):
                 raise
 
         self._pool.enqueue_load(job_id, 1, [load_task])
+
+    @override
+    def cancel_load(self, job_id: JobId) -> bool:
+        if not self._pool.cancel_load(job_id):
+            return False
+        self._load_job_keys.pop(job_id, None)
+        self._load_progress.pop(job_id, None)
+        return True
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:

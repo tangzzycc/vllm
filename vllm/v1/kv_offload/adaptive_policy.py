@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -42,6 +44,8 @@ class AdaptivePolicyConfig:
     max_recompute_tokens_per_request: int | None = 8192
     max_active_recompute_requests: int = 2
     max_active_recompute_tokens: int = 8192
+    recompute_window_seconds: float = 10.0
+    max_recompute_tokens_per_window: int | None = None
 
     VALID_MODES = frozenset({"off", "observe", "enforce"})
 
@@ -135,6 +139,18 @@ class AdaptivePolicyConfig:
                 )
             secondary_bandwidth[str(tier_type)] = parsed
 
+        recompute_window_seconds = nonnegative_float("recompute_window_seconds", 10.0)
+        max_recompute_tokens_per_window = optional_positive_int(
+            "max_recompute_tokens_per_window", None
+        )
+        if max_recompute_tokens_per_window is not None and not (
+            recompute_window_seconds > 0
+        ):
+            raise ValueError(
+                "adaptive_load.recompute_window_seconds must be positive when "
+                "max_recompute_tokens_per_window is set"
+            )
+
         return cls(
             mode=mode,
             prefill_tokens_per_second=prefill_tps,
@@ -157,6 +173,8 @@ class AdaptivePolicyConfig:
             max_active_recompute_tokens=positive_int(
                 "max_active_recompute_tokens", 8192
             ),
+            recompute_window_seconds=recompute_window_seconds,
+            max_recompute_tokens_per_window=max_recompute_tokens_per_window,
         )
 
 
@@ -172,6 +190,8 @@ class AdaptiveOffloadPolicy:
         )
         self._active_requests = 0
         self._active_tokens = 0
+        self._recent_recomputes: deque[tuple[float, int]] = deque()
+        self._recent_tokens = 0
 
     @property
     def enabled(self) -> bool:
@@ -188,6 +208,12 @@ class AdaptiveOffloadPolicy:
     @property
     def active_tokens(self) -> int:
         return self._active_tokens
+
+    def _expire_recompute_history(self, now: float) -> None:
+        cutoff = now - self.config.recompute_window_seconds
+        while self._recent_recomputes and self._recent_recomputes[0][0] <= cutoff:
+            _, tokens = self._recent_recomputes.popleft()
+            self._recent_tokens -= tokens
 
     def observe_h2d(self, num_bytes: int, elapsed_seconds: float) -> None:
         self.h2d.record(num_bytes, elapsed_seconds)
@@ -280,10 +306,15 @@ class AdaptiveOffloadPolicy:
         )
 
     def capacity_reason(self, tokens: int) -> str | None:
+        now = time.monotonic()
+        self._expire_recompute_history(now)
         if self._active_requests >= self.config.max_active_recompute_requests:
             return "max_active_requests"
         if self._active_tokens + tokens > self.config.max_active_recompute_tokens:
             return "max_active_tokens"
+        window_tokens = self.config.max_recompute_tokens_per_window
+        if window_tokens is not None and self._recent_tokens + tokens > window_tokens:
+            return "max_window_tokens"
         return None
 
     def reserve(self, tokens: int) -> bool:
@@ -291,6 +322,9 @@ class AdaptiveOffloadPolicy:
             return False
         self._active_requests += 1
         self._active_tokens += tokens
+        if self.config.max_recompute_tokens_per_window is not None:
+            self._recent_recomputes.append((time.monotonic(), tokens))
+            self._recent_tokens += tokens
         return True
 
     def release(self, tokens: int) -> None:
@@ -299,7 +333,18 @@ class AdaptiveOffloadPolicy:
         self._active_requests = max(0, self._active_requests - 1)
         self._active_tokens = max(0, self._active_tokens - tokens)
 
+    def rollback_reservation(self, tokens: int) -> None:
+        """Undo a reservation when recomputation cannot start."""
+        self.release(tokens)
+        if self.config.max_recompute_tokens_per_window is None:
+            return
+        _, reserved_tokens = self._recent_recomputes.pop()
+        assert reserved_tokens == tokens
+        self._recent_tokens -= reserved_tokens
+
     def reset(self) -> None:
         self.h2d.reset()
         self._active_requests = 0
         self._active_tokens = 0
+        self._recent_recomputes.clear()
+        self._recent_tokens = 0

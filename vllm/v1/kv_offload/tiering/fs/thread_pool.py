@@ -47,6 +47,10 @@ class JobState:
     def job_id(self) -> JobId:
         return self._job_id
 
+    @property
+    def n_tasks(self) -> int:
+        return self._n_tasks
+
     def task_done(
         self, success: bool, transfer_time: float
     ) -> tuple[bool, bool, float]:
@@ -129,6 +133,27 @@ class DualQueueThreadPool:
             for fn in tasks:
                 self._store_q.append((fn, state))
             self._condition.notify(n_tasks)
+
+    def cancel_load(self, job_id: JobId) -> bool:
+        """Remove a load job if none of its tasks has started.
+
+        Args:
+            job_id: The load job to remove.
+
+        Returns:
+            True if the complete job was removed from the queue.
+        """
+        with self._condition:
+            queued = [item for item in self._load_q if item[1].job_id == job_id]
+            if not queued or len(queued) != queued[0][1].n_tasks:
+                return False
+
+            self._load_q = deque(
+                item for item in self._load_q if item[1].job_id != job_id
+            )
+            self._inflight_jobs -= 1
+            self._condition.notify_all()
+            return True
 
     def get_finished(self) -> list[tuple[JobId, bool, float]]:
         # No lock needed: deque is thread-safe for concurrent append/popleft,

@@ -101,7 +101,9 @@ vllm serve <model> \
         "min_recompute_tokens": 256,
         "max_recompute_tokens_per_request": 8192,
         "max_active_recompute_requests": 2,
-        "max_active_recompute_tokens": 8192
+        "max_active_recompute_tokens": 8192,
+        "recompute_window_seconds": 10,
+        "max_recompute_tokens_per_window": 8192
       }
     }
   }'
@@ -111,14 +113,20 @@ Set `mode` to `observe` to emit decisions and cost metrics while retaining the
 normal load behavior. Set it to `enforce` to apply decisions;
 `prefill_tokens_per_second` is required in this mode. Bandwidth values seed the
 estimators during startup. Measured throughput replaces a seed after enough
-completed transfer samples are available.
+completed transfer samples are available. Secondary-tier bandwidth is the
+throughput of one load job; queue time is estimated by assigning earlier jobs
+to the tier's load workers. A filesystem tier can service loads on both its
+read-priority and write-priority worker groups.
 
-An already submitted secondary-to-CPU promotion is not cancelled when a
-request chooses recomputation. The request detaches as a waiter while the
-promotion continues concurrently, allowing a later request to reuse the CPU
-copy. The connector does not write KV through CPU-to-GPU DMA concurrently
-with recomputation into the same GPU blocks. `load_ready` uses disjoint prefix
-and tail ranges, and transfers for other requests can still overlap model work.
+The policy does not race load and recomputation for the same request. A
+promotion that has not been submitted is omitted after its last waiter
+detaches. A queued filesystem promotion is cancelled when none of its keys
+has another waiter, allowing the I/O worker to load a different prefix. If the
+read has already started and cannot be cancelled, recompute admission is
+rejected and the request continues waiting for the load. A shared promotion
+continues for its remaining waiters while the detached request may recompute.
+This keeps load/recompute overlap across requests without duplicating work only
+to select a winner. `load_ready` uses disjoint prefix and tail ranges.
 
 | Key | Required | Default | Notes |
 | --- | --- | --- | --- |
@@ -126,7 +134,7 @@ and tail ranges, and transfers for other requests can still overlap model work.
 | `prefill_tokens_per_second` | enforce only | — | Measured prefill throughput used to estimate recomputation time. |
 | `prefill_fixed_ms` | no | `0` | Fixed prefill cost added to each recompute estimate. |
 | `h2d_bandwidth_bytes_per_second` | no | — | Startup estimate for CPU-to-GPU bandwidth. |
-| `secondary_bandwidth_bytes_per_second` | no | `{}` | Startup bandwidth by tier type, for example `{"fs": 3e9}`. |
+| `secondary_bandwidth_bytes_per_second` | no | `{}` | Startup bandwidth per load job by tier type, for example `{"fs": 3e9}`. |
 | `min_transfer_samples` | no | `8` | Samples required before measured bandwidth replaces a seed. |
 | `estimator_window` | no | `64` | Number of recent transfer observations retained. |
 | `safety_factor` | no | `1.15` | Multiplier applied to an alternative before it may beat loading. |
@@ -135,6 +143,8 @@ and tail ranges, and transfers for other requests can still overlap model work.
 | `max_recompute_tokens_per_request` | no | `8192` | Largest recompute segment; `null` disables this limit. |
 | `max_active_recompute_requests` | no | `2` | Concurrent requests admitted to adaptive recomputation. |
 | `max_active_recompute_tokens` | no | `8192` | Total tokens reserved by active adaptive recomputations. |
+| `recompute_window_seconds` | no | `10` | Rolling interval used by the optional recompute token budget. |
+| `max_recompute_tokens_per_window` | no | `null` | Recompute tokens admitted during the rolling interval; `null` disables this limit. |
 
 ## `kv_connector_extra_config` Reference
 

@@ -125,6 +125,9 @@ class TieringMetricsTracker:
         self._observe_finished_job_stats(job_metadata, result)
         self._decrement_tier_state(job_metadata)
 
+    def on_job_cancelled(self, job_metadata: _JobMetadataLike) -> None:
+        self._decrement_tier_state(job_metadata)
+
     def on_promotion_allocation_failure(self) -> None:
         self._stats.increase_counter(
             TieringOffloadingMetrics.PROMOTION_ALLOCATION_FAILURES

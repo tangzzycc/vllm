@@ -137,7 +137,9 @@ class PendingLoadInfo:
     queued_bytes: int
     elapsed_seconds: float
     waiter_count: int
+    queued_job_bytes: tuple[int, ...] = ()
     bandwidth_bytes_per_second: float | None = None
+    load_parallelism: int = 1
 
 
 class ScheduleEndContext(NamedTuple):
@@ -305,9 +307,17 @@ class OffloadingManager(ABC):
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
-    ) -> None:
-        """Stop tracking a request as a waiter without cancelling promotion."""
-        return
+    ) -> bool:
+        """Stop tracking a request as a waiter.
+
+        Args:
+            keys: Pending offload keys the request will no longer load.
+            req_context: Context of the request leaving the load path.
+
+        Returns:
+            True if the request can proceed without waiting for these loads.
+        """
+        return False
 
     @abstractmethod
     def prepare_store(

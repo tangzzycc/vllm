@@ -870,7 +870,9 @@ class TestTieringOffloadingManager:
         assert info.tier_type == "example"
         assert info.num_bytes == self.manager._primary_chunk_size
         assert info.queued_bytes == 0
+        assert info.queued_job_bytes == ()
         assert info.waiter_count == 2
+        assert info.load_parallelism == 1
 
     def test_pending_promotion_reports_only_earlier_queued_jobs(self, manager_setup):
         first, second = to_keys([0, 1])
@@ -889,8 +891,9 @@ class TestTieringOffloadingManager:
         assert second_info is not None
         assert first_info.queued_bytes == 0
         assert second_info.queued_bytes == self.manager._primary_chunk_size
+        assert second_info.queued_job_bytes == (self.manager._primary_chunk_size,)
 
-    def test_detaching_last_waiter_does_not_cancel_promotion(self, manager_setup):
+    def test_detaching_before_submission_skips_promotion(self, manager_setup):
         shared_chunk = to_keys([0])[0]
         self.secondary_tier1.chunks[shared_chunk] = True
         self.secondary_tier1.submit_load = MagicMock(
@@ -901,17 +904,98 @@ class TestTieringOffloadingManager:
 
         assert self.manager.lookup(shared_chunk, ctx_a) is LookupResult.HIT_PENDING
         assert self.manager.lookup(shared_chunk, ctx_b) is LookupResult.HIT_PENDING
-        self.manager.detach_pending_load([shared_chunk], ctx_a)
+        assert self.manager.detach_pending_load([shared_chunk], ctx_a)
         assert self.manager._active_promotions[shared_chunk].waiters == {"req_b"}
-        self.manager.detach_pending_load([shared_chunk], ctx_b)
+        assert self.manager.detach_pending_load([shared_chunk], ctx_b)
         assert not self.manager._active_promotions[shared_chunk].waiters
 
         self._simulate_on_schedule_end()
-        self.secondary_tier1.submit_load.assert_called_once()
-        assert shared_chunk in self.manager._active_promotions
-
-        self.manager._process_finished_jobs()
+        self.secondary_tier1.submit_load.assert_not_called()
         assert shared_chunk not in self.manager._active_promotions
+        assert self.primary_tier.lookup(shared_chunk, ctx_a) is LookupResult.MISS
+
+    def test_flush_omits_detached_keys_from_promotion(self, manager_setup):
+        kept, detached = to_keys([0, 1])
+        self.secondary_tier1.chunks[kept] = True
+        self.secondary_tier1.chunks[detached] = True
+        self.secondary_tier1.submit_load = MagicMock(
+            wraps=self.secondary_tier1.submit_load
+        )
+        ctx = ReqContext(req_id="req")
+
+        assert self.manager.lookup(kept, ctx) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(detached, ctx) is LookupResult.HIT_PENDING
+        assert self.manager.detach_pending_load([detached], ctx)
+        self._simulate_on_schedule_end()
+
+        submitted_job = self.secondary_tier1.submit_load.call_args.args[0]
+        assert submitted_job.keys == [kept]
+        assert detached not in self.manager._active_promotions
+        assert self.primary_tier.lookup(detached, ctx) is LookupResult.MISS
+
+    def test_detaching_last_job_waiter_cancels_queued_promotion(self, manager_setup):
+        first, second = to_keys([0, 1])
+        self.secondary_tier1.chunks[first] = True
+        self.secondary_tier1.chunks[second] = True
+        self.secondary_tier1.submit_load = MagicMock()
+        self.secondary_tier1.cancel_load = MagicMock(return_value=True)
+        ctx_a = ReqContext(req_id="req_a")
+        ctx_b = ReqContext(req_id="req_b")
+
+        assert self.manager.lookup(first, ctx_a) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(second, ctx_a) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(first, ctx_b) is LookupResult.HIT_PENDING
+        self._simulate_on_schedule_end()
+
+        assert self.manager.detach_pending_load([first, second], ctx_a)
+        self.secondary_tier1.cancel_load.assert_not_called()
+
+        assert self.manager.detach_pending_load([first], ctx_b)
+        self.secondary_tier1.cancel_load.assert_called_once()
+        assert not self.manager._active_promotions
+        assert not self.manager._jobs
+        assert self.primary_tier.lookup(first, ctx_a) is LookupResult.MISS
+        assert self.primary_tier.lookup(second, ctx_a) is LookupResult.MISS
+
+    def test_detaching_waiter_keeps_promotion_that_already_started(self, manager_setup):
+        chunk = to_keys([0])[0]
+        self.secondary_tier1.chunks[chunk] = True
+        self.secondary_tier1.submit_load = MagicMock()
+        self.secondary_tier1.cancel_load = MagicMock(return_value=False)
+        ctx = ReqContext(req_id="req")
+
+        assert self.manager.lookup(chunk, ctx) is LookupResult.HIT_PENDING
+        self._simulate_on_schedule_end()
+        assert not self.manager.detach_pending_load([chunk], ctx)
+
+        self.secondary_tier1.cancel_load.assert_called_once()
+        assert chunk in self.manager._active_promotions
+        assert self.manager._jobs
+        assert self.manager._active_promotions[chunk].waiters == {ctx.req_id}
+
+        job_id = next(iter(self.manager._jobs))
+        self.secondary_tier1.completed_jobs.append(
+            JobResult(job_id=job_id, success=True)
+        )
+        self.manager._process_finished_jobs()
+        assert chunk not in self.manager._active_promotions
+
+    def test_failed_detach_does_not_add_waiter_to_another_request(self, manager_setup):
+        first, second = to_keys([0, 1])
+        self.secondary_tier1.chunks[first] = True
+        self.secondary_tier1.chunks[second] = True
+        self.secondary_tier1.submit_load = MagicMock()
+        self.secondary_tier1.cancel_load = MagicMock(return_value=False)
+        ctx_a = ReqContext(req_id="req_a")
+        ctx_b = ReqContext(req_id="req_b")
+
+        assert self.manager.lookup(first, ctx_a) is LookupResult.HIT_PENDING
+        assert self.manager.lookup(second, ctx_b) is LookupResult.HIT_PENDING
+        self._simulate_on_schedule_end()
+
+        assert not self.manager.detach_pending_load([first, second], ctx_a)
+        assert self.manager._active_promotions[first].waiters == {ctx_a.req_id}
+        assert self.manager._active_promotions[second].waiters == {ctx_b.req_id}
 
     def test_reset_cache_clears_promotion_cost_state(self, manager_setup):
         shared_chunk = to_keys([0])[0]

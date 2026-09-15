@@ -165,7 +165,7 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
             OffloadingCounterMetadata(
                 documentation=(
                     "Number of adaptive recompute choices rejected by an "
-                    "admission budget."
+                    "admission check."
                 ),
                 labelnames=("reason",),
             )

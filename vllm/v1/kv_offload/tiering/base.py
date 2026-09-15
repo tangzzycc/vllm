@@ -134,6 +134,11 @@ class SecondaryTierManager(ABC):
 
     medium: ClassVar[Medium | None] = None
 
+    @property
+    def load_parallelism(self) -> int:
+        """Maximum number of load jobs this tier can service concurrently."""
+        return 1
+
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",
@@ -220,6 +225,18 @@ class SecondaryTierManager(ABC):
                           identifying the primary-tier slots to write into.
         """
         pass
+
+    def cancel_load(self, job_id: JobId) -> bool:
+        """Cancel a load that has not started.
+
+        Args:
+            job_id: The submitted load job to cancel.
+
+        Returns:
+            True only when the job was removed and will not report a
+            completion through get_finished_jobs().
+        """
+        return False
 
     @abstractmethod
     def get_finished_jobs(self) -> Iterable[JobResult]:
@@ -315,8 +332,7 @@ class SecondaryTierManager(ABC):
 
         Implementations must not abort a mid-flight transfer: a partial copy
         would corrupt either the primary memoryview or the secondary backing
-        store. Queued (not-yet-started) transfers may be cancelled, but their
-        failure result must still appear in `get_finished_jobs()`.
+        store.
         """
         pass
 

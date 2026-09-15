@@ -199,7 +199,9 @@ def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
     )
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
-    return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    scheduler.manager.detach_pending_load.return_value = True
+    return scheduler
 
 
 def _make_partial_tail_request(
@@ -288,6 +290,35 @@ def test_adaptive_pending_hit_waits_when_load_is_cheaper():
     scheduler.manager.detach_pending_load.assert_not_called()
 
 
+def test_adaptive_promotion_estimate_accounts_for_load_parallelism():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    _enable_adaptive(
+        scheduler,
+        secondary_bandwidth_bytes_per_second={"fs": 100.0},
+    )
+    pending_key = to_keys([99])[0]
+    result = OffloadLookupResult(
+        0,
+        16,
+        LookupWaitReason.PROMOTION,
+        pending_keys=(pending_key,),
+    )
+    scheduler.manager.get_pending_load_info.return_value = PendingLoadInfo(
+        tier_idx=0,
+        tier_type="fs",
+        num_bytes=100,
+        queued_bytes=300,
+        queued_job_bytes=(150, 150),
+        elapsed_seconds=0.25,
+        waiter_count=1,
+        load_parallelism=4,
+    )
+
+    req_status = scheduler._req_status[request.request_id]
+    assert scheduler._promotion_seconds(result, req_status) == pytest.approx(0.75)
+
+
 def test_adaptive_loads_ready_prefix_and_recomputes_pending_tail():
     scheduler = _make_partial_tail_scheduler()
     request = _make_partial_tail_request(scheduler)
@@ -324,6 +355,51 @@ def test_adaptive_loads_ready_prefix_and_recomputes_pending_tail():
     scheduler.manager.detach_pending_load.assert_called_once_with(
         (pending_key,), state.req_context
     )
+
+
+def test_adaptive_running_promotion_falls_back_to_load():
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    _enable_adaptive(
+        scheduler,
+        prefill_tokens_per_second=1_000.0,
+        h2d_bandwidth_bytes_per_second=1_000_000_000.0,
+        secondary_bandwidth_bytes_per_second={"fs": 1.0},
+        max_recompute_tokens_per_window=16,
+    )
+    pending_key = to_keys([99])[0]
+    scheduler._lookup_frontiers = MagicMock(
+        return_value=OffloadLookupResult(
+            0,
+            16,
+            LookupWaitReason.PROMOTION,
+            pending_keys=(pending_key,),
+        )
+    )
+    scheduler.manager.get_pending_load_info.return_value = PendingLoadInfo(
+        tier_idx=0,
+        tier_type="fs",
+        num_bytes=1024,
+        queued_bytes=0,
+        elapsed_seconds=0.0,
+        waiter_count=1,
+    )
+    scheduler.manager.detach_pending_load.return_value = False
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    state = scheduler._req_status[request.request_id]
+    assert state.adaptive_action is None
+    assert scheduler._adaptive_policy.active_requests == 0
+    assert scheduler._adaptive_policy.active_tokens == 0
+    assert scheduler._adaptive_policy.reserve(16)
+    scheduler.manager.detach_pending_load.assert_called_once_with(
+        (pending_key,), state.req_context
+    )
+    reduced = scheduler._connector_stats.reduce()
+    rejection = (
+        f"{_ConnectorMetricName.ADAPTIVE_ADMISSION_REJECTION}:('promotion_in_flight',)"
+    )
+    assert reduced[rejection] == 1
 
 
 def test_adaptive_admission_rejection_falls_back_to_load():
