@@ -3,6 +3,7 @@
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from itertools import chain, islice
 from typing import Any, NamedTuple
 
@@ -64,6 +65,25 @@ logger = init_logger(__name__)
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
+
+
+class LookupWaitReason(Enum):
+    NONE = "none"
+    PROMOTION = "promotion"
+    RETRY = "retry"
+    GPU_LOAD = "gpu_load"
+
+
+@dataclass(frozen=True, slots=True)
+class OffloadLookupResult:
+    """Ready and eventual external-prefix boundaries for one request."""
+
+    ready_tokens: int
+    candidate_tokens: int
+    wait_reason: LookupWaitReason = LookupWaitReason.NONE
+    pending_keys: tuple[OffloadKey, ...] = ()
+    ready_partial_tail_boundary: int | None = None
+    candidate_partial_tail_boundary: int | None = None
 
 
 @dataclass(slots=True)
@@ -649,10 +669,45 @@ class OffloadingConnectorScheduler:
     ) -> int | None:
         """Return the number of consecutive offloaded chunks from the start,
         or None if the backend deferred a lookup."""
+        return self._maximal_prefix_lookup_mode(
+            keys,
+            req_context,
+            req,
+            group_config,
+            start_chunk_idx,
+            lookup_cache={},
+            include_pending=True,
+            defer_pending=True,
+        )
+
+    def _lookup_key(
+        self,
+        key: OffloadKey,
+        req_context: ReqContext,
+        lookup_cache: dict[OffloadKey, LookupResult],
+    ) -> LookupResult:
+        result = lookup_cache.get(key)
+        if result is None:
+            result = self.manager.lookup(key, req_context)
+            lookup_cache[key] = result
+        return result
+
+    def _maximal_prefix_lookup_mode(
+        self,
+        keys: Iterable[OffloadKey],
+        req_context: ReqContext,
+        req: Request,
+        group_config: GroupOffloadConfig,
+        start_chunk_idx: int,
+        *,
+        lookup_cache: dict[OffloadKey, LookupResult],
+        include_pending: bool,
+        defer_pending: bool = False,
+    ) -> int | None:
         hit_count = 0
         defer_lookup = False
         for local_idx, key in enumerate(keys):
-            result = self.manager.lookup(key, req_context)
+            result = self._lookup_key(key, req_context, lookup_cache)
             match result:
                 case LookupResult.HIT:
                     self._events_tracker.record_lookup(
@@ -663,7 +718,9 @@ class OffloadingConnectorScheduler:
                     )
                     hit_count += 1
                 case LookupResult.HIT_PENDING:
-                    defer_lookup = True
+                    if not include_pending:
+                        break
+                    defer_lookup |= defer_pending
                     hit_count += 1
                 case LookupResult.RETRY:
                     # Don't break: keep scanning to let manager kick off
@@ -684,20 +741,43 @@ class OffloadingConnectorScheduler:
         `sliding_window_size` consecutive hits, scanning from the end.
         The first run may need a larger window for a partial rightmost chunk.
         Returns 0 on miss, None if the backend deferred a lookup."""
+        return self._sliding_window_lookup_mode(
+            keys,
+            sliding_window_size,
+            req_context,
+            initial_window_size,
+            lookup_cache={},
+            include_pending=True,
+            defer_pending=True,
+        )
+
+    def _sliding_window_lookup_mode(
+        self,
+        keys: Sequence[OffloadKey],
+        sliding_window_size: int,
+        req_context: ReqContext,
+        initial_window_size: int | None = None,
+        *,
+        lookup_cache: dict[OffloadKey, LookupResult],
+        include_pending: bool,
+        defer_pending: bool = False,
+    ) -> int | None:
         defer_lookup = False
         pending_in_window = False
         consecutive_hits = 0
         required_window = initial_window_size or sliding_window_size
         for idx in range(len(keys) - 1, -1, -1):
-            match self.manager.lookup(keys[idx], req_context):
+            match self._lookup_key(keys[idx], req_context, lookup_cache):
                 case LookupResult.HIT:
                     consecutive_hits += 1
                 case LookupResult.HIT_PENDING:
-                    # Block is in cache, just not readable yet — counts
-                    # as hit for the consecutive streak. Don't break:
-                    # keep scanning to let manager kick off async lookups.
-                    pending_in_window = True
-                    consecutive_hits += 1
+                    if include_pending:
+                        pending_in_window |= defer_pending
+                        consecutive_hits += 1
+                    else:
+                        consecutive_hits = 0
+                        pending_in_window = False
+                        required_window = sliding_window_size
                 case LookupResult.RETRY:
                     # Block location uncertain — does not count as hit.
                     # Don't break: keep scanning to let manager kick off
@@ -752,6 +832,23 @@ class OffloadingConnectorScheduler:
         self,
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
+    ) -> int | None:
+        return self._lookup_complete_chunks_mode(
+            req_status,
+            max_num_new_tokens,
+            lookup_cache={},
+            include_pending=True,
+            defer_pending=True,
+        )
+
+    def _lookup_complete_chunks_mode(
+        self,
+        req_status: RequestOffloadState,
+        max_num_new_tokens: int | None,
+        *,
+        lookup_cache: dict[OffloadKey, LookupResult],
+        include_pending: bool,
+        defer_pending: bool = False,
     ) -> int | None:
         """
         Find how many tokens beyond num_locally_computed_tokens can be loaded.
@@ -839,13 +936,25 @@ class OffloadingConnectorScheduler:
                 # have backend-confirmed hits
                 num_hit_chunks: int | None
                 if sliding_window_size_in_chunks is None:
-                    num_hit_chunks = self._maximal_prefix_lookup(
-                        offload_keys,
-                        req_status.req_context,
-                        req_status.req,
-                        group_config,
-                        start_chunk_idx,
-                    )
+                    if include_pending and defer_pending:
+                        num_hit_chunks = self._maximal_prefix_lookup(
+                            offload_keys,
+                            req_status.req_context,
+                            req_status.req,
+                            group_config,
+                            start_chunk_idx,
+                        )
+                    else:
+                        num_hit_chunks = self._maximal_prefix_lookup_mode(
+                            offload_keys,
+                            req_status.req_context,
+                            req_status.req,
+                            group_config,
+                            start_chunk_idx,
+                            lookup_cache=lookup_cache,
+                            include_pending=include_pending,
+                            defer_pending=defer_pending,
+                        )
                 else:
                     required_window = sliding_window_size_in_chunks
                     if is_eagle_unverified:
@@ -858,12 +967,23 @@ class OffloadingConnectorScheduler:
                         candidate_end
                     )
                     assert initial_window is not None
-                    num_hit_chunks = self._sliding_window_lookup(
-                        offload_keys,
-                        required_window,
-                        req_status.req_context,
-                        initial_window + int(is_eagle_unverified),
-                    )
+                    if include_pending and defer_pending:
+                        num_hit_chunks = self._sliding_window_lookup(
+                            offload_keys,
+                            required_window,
+                            req_status.req_context,
+                            initial_window + int(is_eagle_unverified),
+                        )
+                    else:
+                        num_hit_chunks = self._sliding_window_lookup_mode(
+                            offload_keys,
+                            required_window,
+                            req_status.req_context,
+                            initial_window + int(is_eagle_unverified),
+                            lookup_cache=lookup_cache,
+                            include_pending=include_pending,
+                            defer_pending=defer_pending,
+                        )
                 if num_hit_chunks == 0:
                     return 0
 
@@ -953,10 +1073,34 @@ class OffloadingConnectorScheduler:
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
     ) -> int | None:
-        complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
-        req_status.partial_tail_boundary = None
+        hit_tokens, partial_tail_boundary = self._lookup_mode(
+            req_status,
+            max_num_new_tokens,
+            lookup_cache={},
+            include_pending=True,
+            defer_pending=True,
+        )
+        req_status.partial_tail_boundary = partial_tail_boundary
+        return hit_tokens
+
+    def _lookup_mode(
+        self,
+        req_status: RequestOffloadState,
+        max_num_new_tokens: int | None,
+        *,
+        lookup_cache: dict[OffloadKey, LookupResult],
+        include_pending: bool,
+        defer_pending: bool = False,
+    ) -> tuple[int | None, int | None]:
+        complete_hit = self._lookup_complete_chunks_mode(
+            req_status,
+            max_num_new_tokens,
+            lookup_cache=lookup_cache,
+            include_pending=include_pending,
+            defer_pending=defer_pending,
+        )
         if complete_hit is None or not self.config.supports_partial_tail:
-            return complete_hit
+            return complete_hit, None
 
         local_tokens = req_status.num_locally_computed_tokens
         complete_boundary = local_tokens + complete_hit
@@ -967,7 +1111,7 @@ class OffloadingConnectorScheduler:
             max_boundary = min(max_boundary, local_tokens + max_num_new_tokens)
         max_boundary = round_down(max_boundary, tokens_per_hash)
         if max_boundary <= complete_boundary:
-            return complete_hit
+            return complete_hit, None
 
         pending = False
         for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
@@ -979,11 +1123,16 @@ class OffloadingConnectorScheduler:
                     req_status.req, group_config.group_idx, boundary
                 )
                 boundary_keys.append(key)
-                result = self.manager.lookup(key, req_status.req_context)
+                result = self._lookup_key(key, req_status.req_context, lookup_cache)
                 if result is LookupResult.MISS:
                     boundary_missed = True
                     break
-                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
+                if result is LookupResult.HIT_PENDING and not include_pending:
+                    boundary_missed = True
+                    break
+                if result is LookupResult.HIT_PENDING and defer_pending:
+                    boundary_pending = True
+                if result is LookupResult.RETRY:
                     boundary_pending = True
 
             pending |= boundary_pending
@@ -994,12 +1143,95 @@ class OffloadingConnectorScheduler:
                     self._events_tracker.record_partial_lookup(
                         req_status.req, group_config, boundary, key
                     )
-                req_status.partial_tail_boundary = boundary
-                return boundary - local_tokens
+                return boundary - local_tokens, boundary
 
         if pending and complete_hit == 0:
-            return None
-        return complete_hit
+            return None, None
+        return complete_hit, None
+
+    def _load_keys_for_boundary(
+        self,
+        req_status: RequestOffloadState,
+        num_external_tokens: int,
+        partial_tail_boundary: int | None,
+    ) -> tuple[OffloadKey, ...]:
+        if num_external_tokens <= 0:
+            return ()
+
+        local_tokens = req_status.num_locally_computed_tokens
+        boundary = local_tokens + num_external_tokens
+        keys: list[OffloadKey] = []
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            tokens_per_chunk = group_config.tokens_per_chunk
+            start_chunk_idx = local_tokens // tokens_per_chunk
+            end_chunk_idx = cdiv(boundary, tokens_per_chunk)
+            group_keys = group_state.offload_keys[start_chunk_idx:end_chunk_idx]
+            window = group_config.load_window_size_in_chunks(boundary)
+            if window is not None:
+                group_keys = group_keys[-window:]
+            if partial_tail_boundary is not None:
+                group_keys = group_keys[:-1]
+            keys.extend(group_keys)
+            if partial_tail_boundary is not None:
+                keys.append(
+                    self._make_boundary_key(
+                        req_status.req,
+                        group_config.group_idx,
+                        partial_tail_boundary,
+                    )
+                )
+        return tuple(keys)
+
+    def _lookup_frontiers(
+        self,
+        req_status: RequestOffloadState,
+        max_num_new_tokens: int | None = None,
+    ) -> OffloadLookupResult:
+        lookup_cache: dict[OffloadKey, LookupResult] = {}
+        candidate_tokens, candidate_partial = self._lookup_mode(
+            req_status,
+            max_num_new_tokens,
+            lookup_cache=lookup_cache,
+            include_pending=True,
+        )
+        if candidate_tokens is None:
+            return OffloadLookupResult(0, 0, LookupWaitReason.RETRY)
+
+        ready_tokens, ready_partial = self._lookup_mode(
+            req_status,
+            max_num_new_tokens,
+            lookup_cache=lookup_cache,
+            include_pending=False,
+        )
+        assert ready_tokens is not None
+        assert ready_tokens <= candidate_tokens
+
+        candidate_keys = self._load_keys_for_boundary(
+            req_status, candidate_tokens, candidate_partial
+        )
+        pending_keys = tuple(
+            key
+            for key in candidate_keys
+            if lookup_cache.get(key) is LookupResult.HIT_PENDING
+        )
+        wait_reason = (
+            LookupWaitReason.PROMOTION if pending_keys else LookupWaitReason.NONE
+        )
+        if self._chunks_being_loaded and any(
+            key in self._chunks_being_loaded for key in candidate_keys
+        ):
+            wait_reason = LookupWaitReason.GPU_LOAD
+
+        return OffloadLookupResult(
+            ready_tokens=ready_tokens,
+            candidate_tokens=candidate_tokens,
+            wait_reason=wait_reason,
+            pending_keys=pending_keys,
+            ready_partial_tail_boundary=ready_partial,
+            candidate_partial_tail_boundary=candidate_partial,
+        )
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
