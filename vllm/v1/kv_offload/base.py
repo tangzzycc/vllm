@@ -127,6 +127,19 @@ class RequestOffloadingContext:
     policy: OffloadPolicy = OffloadPolicy.CHUNK_LEVEL
 
 
+@dataclass(frozen=True, slots=True)
+class PendingLoadInfo:
+    """Cost inputs for secondary-to-primary promotions blocking a request."""
+
+    tier_idx: int
+    tier_type: str
+    num_bytes: int
+    queued_bytes: int
+    elapsed_seconds: float
+    waiter_count: int
+    bandwidth_bytes_per_second: float | None = None
+
+
 class ScheduleEndContext(NamedTuple):
     """Per-step scheduling info passed to on_schedule_end()."""
 
@@ -278,6 +291,22 @@ class OffloadingManager(ABC):
             keys: the keys identifying the blocks.
             req_context: per-request context (e.g. kv_transfer_params).
         """
+        return
+
+    def get_pending_load_info(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PendingLoadInfo | None:
+        """Return promotion cost information for the requested keys."""
+        return None
+
+    def detach_pending_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        """Stop tracking a request as a waiter without cancelling promotion."""
         return
 
     @abstractmethod

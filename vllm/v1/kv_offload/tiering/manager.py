@@ -39,6 +39,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadKey,
     OffloadPolicy,
+    PendingLoadInfo,
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
@@ -55,6 +56,7 @@ from vllm.v1.kv_offload.tiering.base import (
     TransferJob,
 )
 from vllm.v1.kv_offload.tiering.metrics import TieringMetricsTracker
+from vllm.v1.kv_offload.transfer_estimator import TransferRateEstimator
 
 logger = init_logger(__name__)
 
@@ -66,6 +68,15 @@ class PendingPromotion:
     req_context: ReqContext
     keys: list[OffloadKey] = field(default_factory=list)
     chunk_ids: list[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class PromotionState:
+    tier_idx: int
+    created_at: float
+    waiters: set[str]
+    submitted_at: float | None = None
+    job_id: JobId | None = None
 
 
 @dataclass(slots=True)
@@ -204,6 +215,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._jobs: dict[JobId, JobMetadata] = {}
         primary_view = self.primary_tier.get_kv_memoryview()
         assert primary_view.strides is not None
+        self._primary_chunk_size = primary_view.strides[0]
         self._metrics = TieringMetricsTracker(
             tier_types=[tier.tier_type for tier in self.secondary_tiers],
             num_primary_chunks=self.primary_tier._num_chunks,
@@ -215,6 +227,10 @@ class TieringOffloadingManager(OffloadingManager):
         # Outer key: tier index. Inner key: req_context.req_id — the same ReqContext
         # object is reused for all chunk lookups of a given request per engine step.
         self._pending_load_submissions: dict[int, dict[str, PendingPromotion]] = {}
+        self._active_promotions: dict[OffloadKey, PromotionState] = {}
+        self._promotion_estimators = [
+            TransferRateEstimator() for _ in self.secondary_tiers
+        ]
 
         # Gate for once-per-step execution of _maybe_process_finished_jobs().
         # Reset at the end of each step in on_schedule_end().
@@ -326,6 +342,13 @@ class TieringOffloadingManager(OffloadingManager):
                     # secondary→primary transfer (promotion) completed.
                     # Make chunks available in primary tier.
                     self._complete_promotion(job_metadata, completed_job)
+                    if completed_job.transfer_time is not None:
+                        self._promotion_estimators[i].record(
+                            len(transfer_job.keys) * self._primary_chunk_size,
+                            completed_job.transfer_time,
+                        )
+                    for key in transfer_job.keys:
+                        self._active_promotions.pop(key, None)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary chunks.
@@ -381,6 +404,9 @@ class TieringOffloadingManager(OffloadingManager):
         if primary_hit is LookupResult.HIT:
             return LookupResult.HIT
         if primary_hit is LookupResult.HIT_PENDING:
+            promotion = self._active_promotions.get(key)
+            if promotion is not None:
+                promotion.waiters.add(req_context.req_id)
             return LookupResult.HIT_PENDING
 
         any_retry = False
@@ -454,6 +480,13 @@ class TieringOffloadingManager(OffloadingManager):
 
         store_spec = primary_write_result.store_spec
         assert isinstance(store_spec, CPULoadStoreSpec)
+        created_at = time.monotonic()
+        for promoted_key in primary_write_result.keys_to_store:
+            self._active_promotions[promoted_key] = PromotionState(
+                tier_idx=tier_idx,
+                created_at=created_at,
+                waiters={req_context.req_id},
+            )
         # Defer submit_load to on_schedule_end(). Group by (tier, request) so
         # each request's chunks are submitted as one batched job per tier.
         tier_pending = self._pending_load_submissions.setdefault(tier_idx, {})
@@ -488,9 +521,95 @@ class TieringOffloadingManager(OffloadingManager):
                     req_context=entry.req_context,
                 )
                 self._register_job(job_metadata, tier_idx)
+                submitted_at = time.monotonic()
+                for key in entry.keys:
+                    promotion = self._active_promotions[key]
+                    promotion.submitted_at = submitted_at
+                    promotion.job_id = job_id
                 tier.submit_load(job_metadata)
 
         self._pending_load_submissions.clear()
+
+    @override
+    def get_pending_load_info(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PendingLoadInfo | None:
+        relevant = [self._active_promotions.get(key) for key in keys]
+        if not relevant or any(state is None for state in relevant):
+            return None
+        promotions = [state for state in relevant if state is not None]
+        tier_indices = {state.tier_idx for state in promotions}
+        if len(tier_indices) != 1:
+            return None
+        tier_idx = tier_indices.pop()
+        for state in promotions:
+            state.waiters.add(req_context.req_id)
+
+        requested_keys = set(keys)
+        requested_jobs = {
+            state.job_id for state in promotions if state.job_id is not None
+        }
+        submitted = [state.submitted_at for state in promotions]
+        if any(value is None for value in submitted) and any(
+            value is not None for value in submitted
+        ):
+            return None
+        first_submitted = (
+            min(value for value in submitted if value is not None)
+            if submitted and submitted[0] is not None
+            else None
+        )
+        first_created = min(state.created_at for state in promotions)
+        queued_keys = {
+            key
+            for key, state in self._active_promotions.items()
+            if state.tier_idx == tier_idx
+            and key not in requested_keys
+            and state.job_id not in requested_jobs
+            and (
+                (
+                    first_submitted is None
+                    and (
+                        state.submitted_at is not None
+                        or state.created_at < first_created
+                    )
+                )
+                or (
+                    first_submitted is not None
+                    and state.submitted_at is not None
+                    and state.submitted_at <= first_submitted
+                )
+            )
+        }
+        elapsed_seconds = (
+            max(0.0, time.monotonic() - first_submitted)
+            if first_submitted is not None
+            else 0.0
+        )
+        return PendingLoadInfo(
+            tier_idx=tier_idx,
+            tier_type=self.secondary_tiers[tier_idx].tier_type,
+            num_bytes=len(promotions) * self._primary_chunk_size,
+            queued_bytes=len(queued_keys) * self._primary_chunk_size,
+            elapsed_seconds=elapsed_seconds,
+            waiter_count=len(set().union(*(state.waiters for state in promotions))),
+            bandwidth_bytes_per_second=self._promotion_estimators[
+                tier_idx
+            ].bytes_per_second,
+        )
+
+    @override
+    def detach_pending_load(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> None:
+        for key in keys:
+            promotion = self._active_promotions.get(key)
+            if promotion is not None:
+                promotion.waiters.discard(req_context.req_id)
 
     @override
     def prepare_load(
@@ -771,6 +890,7 @@ class TieringOffloadingManager(OffloadingManager):
         *,
         exclude_tier_idx: int | None = None,
     ) -> None:
+        self.detach_pending_load(tuple(self._active_promotions), req_context)
         self.primary_tier.on_request_finished(req_context)
         state = self._req_state[req_context.req_id]
         state.is_finished = True
@@ -881,6 +1001,9 @@ class TieringOffloadingManager(OffloadingManager):
         # reset below invalidates; their submit_load() has not yet been
         # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
+        self._active_promotions.clear()
+        for estimator in self._promotion_estimators:
+            estimator.reset()
         self._metrics.assert_idle()
 
         finished_req_ids = []
