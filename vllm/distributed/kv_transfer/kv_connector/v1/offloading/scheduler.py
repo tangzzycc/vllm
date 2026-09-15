@@ -41,6 +41,12 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.kv_offload.adaptive_policy import (
+    AdaptiveAction,
+    AdaptiveDecision,
+    AdaptiveOffloadPolicy,
+    AdaptivePolicyConfig,
+)
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     Locality,
@@ -101,6 +107,7 @@ class TransferJobStatus:
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
     fenced_block_ids: list[int] | None = None
+    num_bytes: int = 0
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -123,6 +130,7 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    worker_kv_bytes_per_block: int = 0
 
     def load_window_size_in_chunks(self, num_tokens: int) -> int | None:
         window = self.sliding_window_size_in_chunks
@@ -301,6 +309,9 @@ class SchedulerOffloadConfig(NamedTuple):
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
                     ),
+                    worker_kv_bytes_per_block=getattr(
+                        group, "worker_kv_bytes_per_block", 0
+                    ),
                 )
             )
         kv_group_configs = tuple(kv_group_configs_list)
@@ -389,6 +400,9 @@ class RequestOffloadState:
     partial_tail_boundary: int | None = None
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    adaptive_bypass_until: int = 0
+    adaptive_reserved_tokens: int = 0
+    adaptive_action: AdaptiveAction | None = None
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -563,6 +577,9 @@ class OffloadingConnectorScheduler:
         )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
+        self._adaptive_policy = AdaptiveOffloadPolicy(
+            AdaptivePolicyConfig.from_extra_config(getattr(spec, "extra_config", {}))
+        )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -623,6 +640,214 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
+    def _estimate_h2d_bytes(
+        self,
+        req_status: RequestOffloadState,
+        num_external_tokens: int,
+    ) -> int | None:
+        if num_external_tokens <= 0:
+            return 0
+        local_tokens = req_status.num_locally_computed_tokens
+        boundary = local_tokens + num_external_tokens
+        total_bytes = 0
+        for group in self.config.kv_group_configs:
+            if group.worker_kv_bytes_per_block <= 0:
+                return None
+            start_block = local_tokens // group.tokens_per_block
+            end_block = cdiv(boundary, group.tokens_per_block)
+            num_blocks = max(0, end_block - start_block)
+            window = group.load_window_size_in_chunks(boundary)
+            if window is not None:
+                num_blocks = min(
+                    num_blocks,
+                    window * self.config.blocks_per_chunk + 1,
+                )
+            total_bytes += num_blocks * group.worker_kv_bytes_per_block
+        return total_bytes
+
+    def _queued_h2d_bytes(self) -> int:
+        return sum(
+            status.num_bytes for status in self._jobs.values() if not status.is_store
+        )
+
+    def _finish_adaptive_bypass(self, req_status: RequestOffloadState) -> None:
+        if req_status.adaptive_reserved_tokens:
+            self._adaptive_policy.release(req_status.adaptive_reserved_tokens)
+            self._record_adaptive_budget_gauges()
+        req_status.adaptive_bypass_until = 0
+        req_status.adaptive_reserved_tokens = 0
+        req_status.adaptive_action = None
+
+    def _start_adaptive_bypass(
+        self,
+        req_status: RequestOffloadState,
+        result: OffloadLookupResult,
+        action: AdaptiveAction,
+        recompute_tokens: int,
+    ) -> bool:
+        if not self._adaptive_policy.reserve(recompute_tokens):
+            reason = self._adaptive_policy.capacity_reason(recompute_tokens)
+            assert reason is not None
+            self._connector_stats.increase_counter(
+                _ConnectorMetricName.ADAPTIVE_ADMISSION_REJECTION,
+                labelvalues=(reason,),
+            )
+            return False
+        self._record_adaptive_budget_gauges()
+        req_status.adaptive_bypass_until = (
+            req_status.num_locally_computed_tokens + result.candidate_tokens
+        )
+        req_status.adaptive_reserved_tokens = recompute_tokens
+        req_status.adaptive_action = action
+        self.manager.detach_pending_load(result.pending_keys, req_status.req_context)
+        return True
+
+    def _record_adaptive_budget_gauges(self) -> None:
+        self._connector_stats.set_gauge(
+            _ConnectorMetricName.ADAPTIVE_ACTIVE_REQUESTS,
+            self._adaptive_policy.active_requests,
+        )
+        self._connector_stats.set_gauge(
+            _ConnectorMetricName.ADAPTIVE_ACTIVE_TOKENS,
+            self._adaptive_policy.active_tokens,
+        )
+
+    def _record_adaptive_decision(self, decision: AdaptiveDecision) -> None:
+        action = decision.action.value
+        self._connector_stats.increase_counter(
+            _ConnectorMetricName.ADAPTIVE_DECISION,
+            labelvalues=(self._adaptive_policy.config.mode, action, decision.reason),
+        )
+        if decision.wait_seconds is not None:
+            self._connector_stats.observe_histogram(
+                _ConnectorMetricName.ADAPTIVE_WAIT_SECONDS,
+                decision.wait_seconds,
+                labelvalues=(action,),
+            )
+        if decision.selected_seconds is not None:
+            self._connector_stats.observe_histogram(
+                _ConnectorMetricName.ADAPTIVE_SELECTED_SECONDS,
+                decision.selected_seconds,
+                labelvalues=(action,),
+            )
+        if decision.recompute_tokens:
+            self._connector_stats.observe_histogram(
+                _ConnectorMetricName.ADAPTIVE_RECOMPUTE_TOKENS,
+                decision.recompute_tokens,
+                labelvalues=(action,),
+            )
+        logger.debug(
+            "Adaptive KV decision for request: mode=%s action=%s baseline=%s "
+            "reason=%s wait_seconds=%s selected_seconds=%s recompute_tokens=%d",
+            self._adaptive_policy.config.mode,
+            action,
+            decision.baseline_action.value,
+            decision.reason,
+            decision.wait_seconds,
+            decision.selected_seconds,
+            decision.recompute_tokens,
+        )
+
+    def _promotion_seconds(
+        self,
+        result: OffloadLookupResult,
+        req_status: RequestOffloadState,
+    ) -> float | None:
+        pending = self.manager.get_pending_load_info(
+            result.pending_keys, req_status.req_context
+        )
+        if pending is None:
+            return None
+        bandwidth = pending.bandwidth_bytes_per_second
+        if bandwidth is None:
+            configured = (
+                self._adaptive_policy.config.secondary_bandwidth_bytes_per_second or {}
+            )
+            bandwidth = configured.get(pending.tier_type)
+        if bandwidth is None or bandwidth <= 0:
+            return None
+        estimated = (pending.num_bytes + pending.queued_bytes) / bandwidth
+        return max(0.0, estimated - pending.elapsed_seconds)
+
+    def _apply_adaptive_policy(
+        self,
+        req_status: RequestOffloadState,
+        result: OffloadLookupResult,
+    ) -> tuple[int | None, bool]:
+        baseline_tokens = (
+            None
+            if result.wait_reason is not LookupWaitReason.NONE
+            else result.candidate_tokens
+        )
+        if result.candidate_tokens <= 0:
+            req_status.partial_tail_boundary = None
+            return baseline_tokens, False
+        if result.wait_reason in (LookupWaitReason.RETRY, LookupWaitReason.GPU_LOAD):
+            req_status.partial_tail_boundary = None
+            return None, False
+
+        promotion_seconds = 0.0
+        if result.wait_reason is LookupWaitReason.PROMOTION:
+            promotion_estimate = self._promotion_seconds(result, req_status)
+            if promotion_estimate is None:
+                req_status.partial_tail_boundary = None
+                return None, False
+            promotion_seconds = promotion_estimate
+
+        ready_bytes = self._estimate_h2d_bytes(req_status, result.ready_tokens)
+        candidate_bytes = self._estimate_h2d_bytes(req_status, result.candidate_tokens)
+        if ready_bytes is None or candidate_bytes is None:
+            req_status.partial_tail_boundary = (
+                result.candidate_partial_tail_boundary
+                if baseline_tokens is not None
+                else None
+            )
+            return baseline_tokens, bool(baseline_tokens)
+
+        decision = self._adaptive_policy.decide(
+            ready_tokens=result.ready_tokens,
+            candidate_tokens=result.candidate_tokens,
+            ready_h2d_bytes=ready_bytes,
+            candidate_h2d_bytes=candidate_bytes,
+            queued_h2d_bytes=self._queued_h2d_bytes(),
+            promotion_seconds=promotion_seconds,
+        )
+        self._record_adaptive_decision(decision)
+        if not self._adaptive_policy.enforce:
+            req_status.partial_tail_boundary = (
+                result.candidate_partial_tail_boundary
+                if baseline_tokens is not None
+                else None
+            )
+            return baseline_tokens, bool(baseline_tokens)
+
+        if decision.action is AdaptiveAction.LOAD_READY:
+            if not self._start_adaptive_bypass(
+                req_status,
+                result,
+                decision.action,
+                decision.recompute_tokens,
+            ):
+                req_status.partial_tail_boundary = None
+                return baseline_tokens, bool(baseline_tokens)
+            req_status.partial_tail_boundary = result.ready_partial_tail_boundary
+            return result.ready_tokens, bool(result.ready_tokens)
+
+        if decision.action is AdaptiveAction.RECOMPUTE:
+            if not self._start_adaptive_bypass(
+                req_status,
+                result,
+                decision.action,
+                decision.recompute_tokens,
+            ):
+                req_status.partial_tail_boundary = None
+                return baseline_tokens, bool(baseline_tokens)
+            req_status.partial_tail_boundary = None
+            return 0, False
+
+        req_status.partial_tail_boundary = result.candidate_partial_tail_boundary
+        return baseline_tokens, bool(baseline_tokens)
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -1284,12 +1509,24 @@ class OffloadingConnectorScheduler:
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
 
+        if req_status.adaptive_bypass_until:
+            if num_computed_tokens < req_status.adaptive_bypass_until:
+                req_status.update_num_hit_chunks(num_computed_tokens)
+                return 0, False
+            self._finish_adaptive_bypass(req_status)
+
         num_hit_tokens: int | None
         if request.skip_reading_prefix_cache:
             num_hit_tokens = 0
         else:
             lookup_start = time.monotonic()
-            num_hit_tokens = self._lookup(req_status, max_num_new_tokens)
+            if self._adaptive_policy.enabled:
+                lookup_result = self._lookup_frontiers(req_status, max_num_new_tokens)
+                num_hit_tokens, _ = self._apply_adaptive_policy(
+                    req_status, lookup_result
+                )
+            else:
+                num_hit_tokens = self._lookup(req_status, max_num_new_tokens)
             self._connector_stats.observe_histogram(
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
@@ -1301,7 +1538,8 @@ class OffloadingConnectorScheduler:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
-        self._touch(req_status)
+        if req_status.adaptive_action is not AdaptiveAction.RECOMPUTE:
+            self._touch(req_status)
 
         return num_hit_tokens, bool(num_hit_tokens)
 
@@ -1412,6 +1650,10 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
+            num_bytes=sum(
+                group_size * group.worker_kv_bytes_per_block
+                for group_size, group in zip(group_sizes, self.config.kv_group_configs)
+            ),
         )
 
         if self._chunks_being_loaded is not None:
@@ -1432,7 +1674,17 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status[req_id]
             req_status.update_offload_keys()
 
+            if req_status.adaptive_bypass_until:
+                scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                if (
+                    scheduled_tokens > 0
+                    and req_status.req.num_computed_tokens + scheduled_tokens
+                    >= req_status.adaptive_bypass_until
+                ):
+                    self._finish_adaptive_bypass(req_status)
+
             if preempted:
+                self._finish_adaptive_bypass(req_status)
                 for group_state in req_status.group_states:
                     group_state.block_ids.clear()
 
@@ -2018,6 +2270,7 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
+            self._finish_adaptive_bypass(req_status)
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
@@ -2050,6 +2303,10 @@ class OffloadingConnectorScheduler:
         if not meta.transfer_stats.is_empty():
             transfer_stats = OffloadingConnectorStats()
             if not meta.transfer_stats.load.is_empty():
+                self._adaptive_policy.observe_h2d(
+                    meta.transfer_stats.load.bytes,
+                    meta.transfer_stats.load.time,
+                )
                 transfer_stats.increase_counter(
                     _TransferMetricName.LOAD_BYTES,
                     meta.transfer_stats.load.bytes,
@@ -2154,6 +2411,7 @@ class OffloadingConnectorScheduler:
             self.manager.on_request_finished(req_context)
             return False, None
 
+        self._finish_adaptive_bypass(req_status)
         self._maybe_observe_lookup_async_delay(req_status)
 
         # Update offload keys with final block hash so _build_store_jobs can
@@ -2206,6 +2464,7 @@ class OffloadingConnectorScheduler:
 
         # Reset store progress so active requests re-offload from chunk 0.
         for status in self._req_status.values():
+            self._finish_adaptive_bypass(status)
             for group_state in status.group_states:
                 group_state.next_stored_chunk_idx = 0
             status.transfer_jobs.clear()
@@ -2219,6 +2478,7 @@ class OffloadingConnectorScheduler:
         # The manager pool is empty; pending event payloads and announced
         # reference counts are stale.
         self._events_tracker.reset()
+        self._adaptive_policy.reset()
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.
         # The load flush IDs collected above must be delivered to workers.

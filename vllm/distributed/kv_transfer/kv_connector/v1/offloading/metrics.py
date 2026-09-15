@@ -36,6 +36,13 @@ class _ConnectorMetricName:
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
+    ADAPTIVE_DECISION = "vllm:kv_offload_adaptive_decision"
+    ADAPTIVE_WAIT_SECONDS = "vllm:kv_offload_adaptive_wait_seconds"
+    ADAPTIVE_SELECTED_SECONDS = "vllm:kv_offload_adaptive_selected_seconds"
+    ADAPTIVE_RECOMPUTE_TOKENS = "vllm:kv_offload_adaptive_recompute_tokens"
+    ADAPTIVE_ADMISSION_REJECTION = "vllm:kv_offload_adaptive_admission_rejection"
+    ADAPTIVE_ACTIVE_REQUESTS = "vllm:kv_offload_adaptive_active_requests"
+    ADAPTIVE_ACTIVE_TOKENS = "vllm:kv_offload_adaptive_active_tokens"
 
 
 class _TransferType:
@@ -125,6 +132,49 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
             documentation=(
                 "Number of KV offload store allocation attempts that failed."
             ),
+        ),
+        _ConnectorMetricName.ADAPTIVE_DECISION: OffloadingCounterMetadata(
+            documentation=(
+                "Number of adaptive KV offload decisions by mode, selected "
+                "action, and reason."
+            ),
+            labelnames=("mode", "action", "reason"),
+        ),
+        _ConnectorMetricName.ADAPTIVE_WAIT_SECONDS: OffloadingHistogramMetadata(
+            documentation=(
+                "Estimated duration of waiting for and loading the full KV "
+                "prefix, in seconds."
+            ),
+            labelnames=("action",),
+        ),
+        _ConnectorMetricName.ADAPTIVE_SELECTED_SECONDS: (
+            OffloadingHistogramMetadata(
+                documentation=(
+                    "Estimated duration of the selected adaptive KV action, in seconds."
+                ),
+                labelnames=("action",),
+            )
+        ),
+        _ConnectorMetricName.ADAPTIVE_RECOMPUTE_TOKENS: (
+            OffloadingHistogramMetadata(
+                documentation=("Number of tokens selected for adaptive recomputation."),
+                labelnames=("action",),
+            )
+        ),
+        _ConnectorMetricName.ADAPTIVE_ADMISSION_REJECTION: (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of adaptive recompute choices rejected by an "
+                    "admission budget."
+                ),
+                labelnames=("reason",),
+            )
+        ),
+        _ConnectorMetricName.ADAPTIVE_ACTIVE_REQUESTS: OffloadingGaugeMetadata(
+            documentation="Number of requests currently admitted for recomputation."
+        ),
+        _ConnectorMetricName.ADAPTIVE_ACTIVE_TOKENS: OffloadingGaugeMetadata(
+            documentation="Number of tokens currently reserved for recomputation."
         ),
     }
 
