@@ -240,3 +240,17 @@ def test_paired_executor_closes_consumer_before_allocation_owner(monkeypatch):
     executor.shutdown()
     executor.shutdown()
     assert order == ["consumer-close", "owner-close"]
+
+
+def test_paired_late_cancel_does_not_retain_a_completed_identity():
+    """A cancel sent just after P completion cannot grow the cancelled work set."""
+    from unittest.mock import Mock
+
+    from vllm.v1.rapidserve.prefill import PrefillEngine
+    from vllm.v1.rapidserve.scheduler import PrefillIdentity
+
+    engine = PrefillEngine(Mock(), Mock())
+    engine.session = "session"
+    engine.last_sequence = 1
+    engine.cancel([PrefillIdentity("session", 1, "request")])
+    assert not engine.cancelled

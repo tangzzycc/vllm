@@ -36,8 +36,12 @@ class PrefillEngine:
             self.waiting.append((work, 0))
 
     def cancel(self, works):
+        active = {work.sequence for work, _ in self.waiting}
+        active.update(
+            work.sequence for selected, _, _ in self.pending for work, _ in selected
+        )
         for work in works:
-            if work.session == self.session:
+            if work.session == self.session and work.sequence in active:
                 self.cancelled.add(work.sequence)
 
     def finish(self, work, result):

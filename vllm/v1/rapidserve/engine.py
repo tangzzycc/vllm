@@ -183,7 +183,9 @@ class PairedCoordinator:
         """Wait for submitted GPU work before an in-process pause completes."""
         deadline = time.monotonic() + 30
         outputs: dict[int, EngineCoreOutputs] = {}
-        while self.core.scheduler.leases or self.pending:
+        while (
+            self.core.scheduler.leases or self.pending or self.policy_target is not None
+        ):
             incoming, _ = self.step()
             self.merge(outputs, incoming)
             if time.monotonic() > deadline:

@@ -127,6 +127,8 @@ def validate_shared_model(config: VllmConfig) -> None:
         or config.weight_transfer_config is not None
         or config.watermark_config is not None
         or model.enable_trace_replay
+        or model.return_sampling_mask
+        or model.is_diffusion
     ):
         raise ValueError(
             "Shared MRV2 storage requires single-GPU resident dense text models"
