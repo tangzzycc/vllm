@@ -257,7 +257,12 @@ class EngineCore:
         if paired:
             from vllm.v1.rapidserve.engine import PairedCoordinator
 
-            self.paired = PairedCoordinator(self)
+            try:
+                self.paired = PairedCoordinator(self)
+            except BaseException:
+                self.model_executor.shutdown()
+                cleanup_dist_env_and_memory()
+                raise
             self.step_fn = self.paired.step
 
         self._idle_state_callbacks: list[Callable] = []

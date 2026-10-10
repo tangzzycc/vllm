@@ -55,11 +55,19 @@ def run_prefill(config, connection: Connection) -> None:
     except (EOFError, BrokenPipeError):
         pass
     except Exception:
-        with suppress(BrokenPipeError, OSError):
+        with suppress(EOFError, BrokenPipeError, OSError):
             connection.send(("error", traceback.format_exc()))
+            # Keep exported storage alive while decode tears down its mappings.
+            deadline = time.monotonic() + 30
+            while connection.poll(max(0, deadline - time.monotonic())):
+                method, _ = connection.recv()
+                if method == "close":
+                    break
+                if time.monotonic() >= deadline:
+                    break
     finally:
         if executor is not None:
             executor.shutdown()
-            destroy_model_parallel()
-            destroy_distributed_environment()
+        destroy_model_parallel()
+        destroy_distributed_environment()
         connection.close()

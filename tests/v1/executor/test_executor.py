@@ -254,3 +254,39 @@ def test_paired_late_cancel_does_not_retain_a_completed_identity():
     engine.last_sequence = 1
     engine.cancel([PrefillIdentity("session", 1, "request")])
     assert not engine.cancelled
+
+
+def test_paired_owner_error_waits_for_consumer_before_teardown(monkeypatch):
+    """A P bootstrap error retains exported storage until D closes its channel."""
+    from unittest.mock import Mock
+
+    from vllm.v1.rapidserve import process
+    from vllm.v1.rapidserve.worker import SharedModelWorker
+
+    order = []
+    worker = SharedModelWorker.__new__(SharedModelWorker)
+    monkeypatch.setattr(worker, "export_weights", Mock(return_value="weights"))
+    monkeypatch.setattr(
+        worker, "export_kv", Mock(side_effect=RuntimeError("KV export failed"))
+    )
+    executor = Mock()
+    executor.driver_worker.worker = worker
+    executor.shutdown.side_effect = lambda: order.append("owner-shutdown")
+    monkeypatch.setattr(process, "UniProcExecutor", lambda _: executor)
+    monkeypatch.setattr(process, "destroy_model_parallel", lambda: None)
+    monkeypatch.setattr(process, "destroy_distributed_environment", lambda: None)
+    connection = Mock()
+    connection.poll.return_value = True
+
+    def receive():
+        if order:
+            order.append("consumer-close")
+            return "close", ()
+        order.append("export")
+        return "export_kv", ()
+
+    connection.recv.side_effect = receive
+    process.run_prefill(Mock(), connection)
+    assert order == ["export", "consumer-close", "owner-shutdown"]
+    error = connection.send.call_args_list[-1].args[0]
+    assert error[0] == "error" and "KV export failed" in error[1]
