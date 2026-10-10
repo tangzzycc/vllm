@@ -11,11 +11,22 @@ from vllm.v1.request import Request
 
 
 @dataclass(frozen=True)
+class PrefillIdentity:
+    session: str
+    sequence: int
+    req_id: str
+
+
+@dataclass(frozen=True)
 class PrefillWork:
     session: str
     sequence: int
     request: NewRequestData
     num_tokens: int
+
+    @property
+    def identity(self) -> PrefillIdentity:
+        return PrefillIdentity(self.session, self.sequence, self.request.req_id)
 
 
 class DecodeScheduler(Scheduler):
@@ -40,6 +51,7 @@ class DecodeScheduler(Scheduler):
             or request.use_structured_output
             or params is None
             or params.prompt_logprobs is not None
+            or params.logprobs is not None
             or params.temperature != 0
         ):
             raise ValueError("Paired execution supports greedy text requests")
@@ -129,8 +141,10 @@ class DecodeScheduler(Scheduler):
         self.reset_preempted_req_ids.update(output.preempted_req_ids or set())
         return works
 
-    def complete_prefill(self, work: PrefillWork, result: ModelRunnerOutput):
-        req_id = work.request.req_id
+    def complete_prefill(
+        self, work: PrefillWork | PrefillIdentity, result: ModelRunnerOutput
+    ):
+        req_id = work.request.req_id if isinstance(work, PrefillWork) else work.req_id
         lease = self.leases.get(req_id)
         if lease is None or (lease[0].session, lease[0].sequence) != (
             work.session,
@@ -144,6 +158,8 @@ class DecodeScheduler(Scheduler):
 
     def _release_retired(self, req_ids: set[str]):
         for req_id in self.retired & req_ids:
+            if req_id in self.leases or req_id in self.decode_in_flight:
+                continue
             request = self.requests.get(req_id)
             if request is not None:
                 super()._free_blocks(request)
@@ -158,3 +174,8 @@ class DecodeScheduler(Scheduler):
 
     def has_requests(self) -> bool:
         return bool(self.leases or self.decode_in_flight) or super().has_requests()
+
+    def reset_prefix_cache(self, reset_running_requests=False, reset_connector=False):
+        if reset_running_requests and (self.leases or self.decode_in_flight):
+            raise ValueError("Cannot reset shared KV while GPU work is in flight")
+        return super().reset_prefix_cache(reset_running_requests, reset_connector)

@@ -3,6 +3,7 @@
 
 import time
 import traceback
+from contextlib import suppress
 from multiprocessing.connection import Connection
 
 from vllm.config import set_current_vllm_config
@@ -41,12 +42,17 @@ def run_prefill(config, connection: Connection) -> None:
                     engine.add(args[0])
                     engine.step()
                     continue
+                if method == "cancel":
+                    assert engine is not None
+                    engine.cancel(args[0])
+                    continue
                 result = getattr(worker, method)(*args)
                 connection.send(("result", result))
     except (EOFError, BrokenPipeError):
         pass
     except Exception:
-        connection.send(("error", traceback.format_exc()))
+        with suppress(BrokenPipeError, OSError):
+            connection.send(("error", traceback.format_exc()))
     finally:
         if executor is not None:
             executor.shutdown()

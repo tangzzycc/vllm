@@ -3,6 +3,10 @@
 
 from contextlib import suppress
 from copy import deepcopy
+from multiprocessing.connection import wait
+from queue import Queue
+from threading import Thread
+from weakref import ref
 
 from vllm.config import set_current_vllm_config
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
@@ -17,6 +21,12 @@ class PairedExecutor(UniProcExecutor):
     """Decode's local worker with a separately scheduled prefill process."""
 
     def _init_executor(self) -> None:
+        self.shutting_down = False
+        self.is_failed = False
+        self.failure_callback = None
+        self.outbound: Queue | None = None
+        self.sender: Thread | None = None
+        self.send_error: Exception | None = None
         validate_shared_model(self.vllm_config)
         if not self.vllm_config.model_config.enforce_eager:
             raise ValueError("Paired execution initially requires eager mode")
@@ -77,8 +87,31 @@ class PairedExecutor(UniProcExecutor):
         return result
 
     def prefill_rpc(self, method, *args):
+        if self.outbound is not None:
+            raise RuntimeError("Synchronous prefill RPC is only valid during bootstrap")
         self.connection.send((method, args))
-        return self._receive("result")
+        result = self._receive("result")
+        if method == "start":
+            self.outbound = Queue(maxsize=4)
+            outbound = self.outbound
+            connection = self.connection
+
+            def send():
+                try:
+                    while True:
+                        message = outbound.get()
+                        connection.send(message)
+                        if message[0] == "close":
+                            return
+                except (OSError, EOFError) as error:
+                    self.send_error = error
+
+            self.sender = Thread(target=send, name="PrefillSender", daemon=True)
+            self.sender.start()
+        return result
+
+    def can_send(self) -> bool:
+        return self.outbound is not None and not self.outbound.full()
 
     def determine_available_memory(self):
         return [self.vllm_config.cache_config.kv_cache_memory_bytes]
@@ -97,7 +130,27 @@ class PairedExecutor(UniProcExecutor):
         super().compile_or_warm_up_model()
 
     def send_prefills(self, works):
-        self.connection.send(("work", (works,)))
+        assert self.outbound is not None
+        self.outbound.put_nowait(("work", (works,)))
+
+    def send_cancellations(self, works):
+        assert self.outbound is not None
+        self.outbound.put_nowait(("cancel", ([work.identity for work in works],)))
+
+    def register_failure_callback(self, callback):
+        self.failure_callback = callback
+        reference = ref(self)
+        sentinel = self.prefill_process.sentinel
+
+        def monitor():
+            wait([sentinel])
+            executor = reference()
+            if executor is None or executor.shutting_down:
+                return
+            executor.is_failed = True
+            callback()
+
+        Thread(target=monitor, name="PrefillMonitor", daemon=True).start()
 
     def poll_prefills(self):
         results = []
@@ -106,18 +159,42 @@ class PairedExecutor(UniProcExecutor):
         return results
 
     def check_health(self):
+        if self.send_error is not None:
+            raise RuntimeError("Prefill communication failed") from self.send_error
         if self.prefill_process is None or not self.prefill_process.is_alive():
             raise RuntimeError("Prefill process exited")
 
+    def collective_rpc(self, method, *args, **kwargs):
+        if method in (
+            "sleep",
+            "wake_up",
+            "release_kv_cache_memory",
+            "update_weights",
+            "start_weight_update",
+            "finish_weight_update",
+        ):
+            raise ValueError(f"Paired execution does not support {method}")
+        if method == "synchronize_device" and self.outbound is None:
+            self.prefill_rpc(method)
+        return super().collective_rpc(method, *args, **kwargs)
+
     def shutdown(self):
+        self.shutting_down = True
         if getattr(self, "driver_worker", None) is not None:
             super().shutdown()
             del self.driver_worker
         connection = getattr(self, "connection", None)
         process = getattr(self, "prefill_process", None)
         if connection is not None:
-            with suppress(EOFError, BrokenPipeError, OSError):
-                connection.send(("close", ()))
+            if getattr(self, "outbound", None) is not None:
+                assert self.outbound is not None
+                with suppress(Exception):
+                    self.outbound.put(("close", ()), timeout=1)
+                if self.sender is not None:
+                    self.sender.join(1)
+            else:
+                with suppress(EOFError, BrokenPipeError, OSError):
+                    connection.send(("close", ()))
             connection.close()
             self.connection = None
         if process is not None:

@@ -7636,3 +7636,33 @@ def test_paired_first_token_finishes_without_decode():
     assert request.is_finished()
     assert scheduler.complete_prefill(work, result) == {}
     assert not scheduler.schedule().num_scheduled_tokens
+
+
+def test_paired_cancel_ack_drops_output_and_releases_lease():
+    """A P cancellation ACK has no sampled tokens and still releases pinned KV."""
+    from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    scheduler = create_scheduler(scheduler_cls=DecodeScheduler)
+    request = create_requests(1)[0]
+    request.sampling_params.temperature = 0
+    scheduler.add_request(request)
+    work = scheduler.grant_prefills()[0]
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.complete_prefill(work, EMPTY_MODEL_RUNNER_OUTPUT)
+    assert request.request_id not in scheduler.requests
+    assert not scheduler.leases
+
+
+def test_paired_cache_reset_rejects_an_active_external_writer():
+    """An explicit cache reset cannot bypass a P lease's reuse fence."""
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    scheduler = create_scheduler(scheduler_cls=DecodeScheduler)
+    request = create_requests(1)[0]
+    request.sampling_params.temperature = 0
+    scheduler.add_request(request)
+    scheduler.grant_prefills()
+    with pytest.raises(ValueError, match="in flight"):
+        scheduler.reset_prefix_cache(reset_running_requests=True)
+    assert request.request_id in scheduler.leases

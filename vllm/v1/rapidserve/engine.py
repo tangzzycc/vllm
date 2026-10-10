@@ -30,6 +30,8 @@ class PairedCoordinator:
         self.core = core
         self.pending = None
         self.registered = set()
+        self.cancel_sent: set[int] = set()
+        self.buffered: dict[int, EngineCoreOutputs] = {}
         self.core.model_executor.prefill_rpc("start")
 
     @staticmethod
@@ -56,9 +58,19 @@ class PairedCoordinator:
         assert isinstance(scheduler, DecodeScheduler)
         executor.check_health()
         core._process_aborts_queue()
-        outputs: dict[int, EngineCoreOutputs] = {}
+        outputs, self.buffered = self.buffered, {}
         progressed = False
+        cancelled = [
+            work
+            for req_id, (work, _) in scheduler.leases.items()
+            if scheduler.requests[req_id].is_finished()
+            and work.sequence not in self.cancel_sent
+        ]
+        if cancelled and executor.can_send():
+            executor.send_cancellations(cancelled)
+            self.cancel_sent.update(work.sequence for work in cancelled)
         for work, result in executor.poll_prefills():
+            self.cancel_sent.discard(work.sequence)
             self.merge(outputs, scheduler.complete_prefill(work, result))
             progressed = True
         if self.pending:
@@ -73,7 +85,7 @@ class PairedCoordinator:
                 self.merge(outputs, scheduler.complete_decode(batch, model_output))
                 progressed = True
         # Bound the P queue by the global admission cap owned by D.
-        works = scheduler.grant_prefills()
+        works = scheduler.grant_prefills() if executor.can_send() else []
         if works:
             executor.send_prefills(works)
             progressed = True
@@ -135,3 +147,14 @@ class PairedCoordinator:
         if not progressed and scheduler.has_requests():
             time.sleep(0.0001)
         return outputs, progressed
+
+    def drain(self):
+        """Wait for submitted GPU work before an in-process pause completes."""
+        deadline = time.monotonic() + 30
+        outputs: dict[int, EngineCoreOutputs] = {}
+        while self.core.scheduler.leases or self.pending:
+            incoming, _ = self.step()
+            self.merge(outputs, incoming)
+            if time.monotonic() > deadline:
+                raise RuntimeError("Timed out draining paired execution")
+        self.merge(self.buffered, outputs)
