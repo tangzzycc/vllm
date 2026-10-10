@@ -46,6 +46,10 @@ def run_prefill(config, connection: Connection) -> None:
                     assert engine is not None
                     engine.cancel(args[0])
                     continue
+                if method == "policy":
+                    assert engine is not None and not engine.has_work()
+                    connection.send(("policy_done", worker.set_resource_policy(*args)))
+                    continue
                 result = getattr(worker, method)(*args)
                 connection.send(("result", result))
     except (EOFError, BrokenPipeError):

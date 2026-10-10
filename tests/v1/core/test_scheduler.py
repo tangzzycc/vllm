@@ -7701,3 +7701,24 @@ def test_paired_async_decode_pins_blocks_until_last_batch_completes():
     scheduler.complete_decode(second, result)
     assert request.request_id not in scheduler.requests
     assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() > before
+
+
+def test_paired_resource_policy_keeps_an_idle_engine_stepping():
+    """An idle policy ACK is consumed without waiting for another request."""
+    from types import SimpleNamespace
+
+    from vllm.v1.rapidserve.engine import PairedCoordinator
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    core = SimpleNamespace(scheduler=SimpleNamespace(resource_policy_pending=False))
+    coordinator = PairedCoordinator.__new__(PairedCoordinator)
+    coordinator.core = core
+    coordinator.policy_target = None
+    coordinator.policy_epoch = 0
+    coordinator.request_resource_policy(0.5)
+    assert core.scheduler.resource_policy_pending
+    with pytest.raises(ValueError, match="already pending"):
+        coordinator.request_resource_policy(0)
+    scheduler = DecodeScheduler.__new__(DecodeScheduler)
+    scheduler.resource_policy_pending = True
+    assert scheduler.has_requests()

@@ -960,6 +960,12 @@ class RocmPlatform(Platform):
         )
 
     @classmethod
+    def create_cu_masked_stream(cls, mask: list[int], device: torch.device):
+        from vllm.platforms.rocm_stream import CuMaskedStream
+
+        return CuMaskedStream(mask, device)
+
+    @classmethod
     def set_device(cls, device: torch.device) -> None:
         """Set the device for the current platform."""
         torch.cuda.set_device(device)

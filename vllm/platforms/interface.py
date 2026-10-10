@@ -626,6 +626,11 @@ class Platform:
         return torch.inference_mode(mode=True)
 
     @classmethod
+    def create_cu_masked_stream(cls, mask: list[int], device: torch.device):
+        """Create an owned native stream restricted to the requested CUs."""
+        raise NotImplementedError("CU-masked streams require ROCm")
+
+    @classmethod
     def set_device(cls, device: torch.device) -> None:
         """Set the device for the current platform."""
         raise NotImplementedError

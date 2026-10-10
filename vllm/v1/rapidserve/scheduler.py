@@ -42,6 +42,7 @@ class DecodeScheduler(Scheduler):
         self.retired: set[str] = set()
         self.decode_in_flight: Counter[str] = Counter()
         self.prefill_selection = False
+        self.resource_policy_pending = False
 
     def add_request(self, request: Request) -> None:
         if request.request_id in self.requests:
@@ -54,6 +55,11 @@ class DecodeScheduler(Scheduler):
             or params is None
             or params.prompt_logprobs is not None
             or params.logprobs is not None
+            or params.logprob_token_ids is not None
+            or params.prompt_logprob_token_ids is not None
+            or params.thinking_token_budget is not None
+            or params.trace_decode_token_ids is not None
+            or params.watermarking
             or params.temperature != 0
         ):
             raise ValueError("Paired execution supports greedy text requests")
@@ -182,7 +188,11 @@ class DecodeScheduler(Scheduler):
         return output
 
     def has_requests(self) -> bool:
-        return bool(self.leases or self.decode_in_flight) or super().has_requests()
+        return (
+            self.resource_policy_pending
+            or bool(self.leases or self.decode_in_flight)
+            or super().has_requests()
+        )
 
     def reset_prefix_cache(self, reset_running_requests=False, reset_connector=False):
         if reset_running_requests and (self.leases or self.decode_in_flight):

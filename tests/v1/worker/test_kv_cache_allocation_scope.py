@@ -202,3 +202,18 @@ def test_imported_mrv2_kv_is_bound_without_allocating(monkeypatch) -> None:
     )
     assert result is caches
     assert bound["layer"] is caches["layer"]
+
+
+@pytest.mark.parametrize("total,fraction", [(20, 0.5), (64, 0.3), (120, 0.7)])
+def test_paired_cu_masks_partition_all_cu_pairs(total, fraction):
+    """Each CU belongs to one role and adjacent CU pairs stay together."""
+    from vllm.v1.rapidserve.resources import partition_cus
+
+    prefill, decode = partition_cus(total, fraction)
+    for cu in range(total):
+        p = bool(prefill[cu // 32] & (1 << (cu % 32)))
+        d = bool(decode[cu // 32] & (1 << (cu % 32)))
+        assert p != d
+        if cu % 2:
+            assert p == bool(prefill[(cu - 1) // 32] & (1 << ((cu - 1) % 32)))
+    assert sum(word.bit_count() for word in prefill + decode) == total

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import suppress
 from copy import deepcopy
 from multiprocessing.connection import wait
@@ -10,6 +11,7 @@ from weakref import ref
 
 from vllm.config import set_current_vllm_config
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
+from vllm.platforms import current_platform
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.rapidserve.ipc import validate_shared_model
@@ -28,6 +30,22 @@ class PairedExecutor(UniProcExecutor):
         self.sender: Thread | None = None
         self.send_error: Exception | None = None
         validate_shared_model(self.vllm_config)
+        if current_platform.is_rocm():
+            # HIP's parallel graph queues do not inherit the launch stream CU mask.
+            for name, value in (
+                ("DEBUG_HIP_FORCE_GRAPH_QUEUES", "1"),
+                ("DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING", "0"),
+            ):
+                if os.environ.get(name, value) != value:
+                    raise ValueError(f"Paired ROCm execution requires {name}={value}")
+                os.environ[name] = value
+        options = self.vllm_config.additional_config
+        assert isinstance(options, dict)
+        fraction = float(options.get("rapidserve_cu_fraction", 0))
+        if fraction and (not current_platform.is_rocm() or not 0 < fraction < 1):
+            raise ValueError(
+                "CU fraction requires ROCm and must be between zero and one"
+            )
         if not self.vllm_config.cache_config.kv_cache_memory_bytes:
             raise ValueError(
                 "Paired execution currently requires a fixed KV byte budget"
@@ -42,6 +60,10 @@ class PairedExecutor(UniProcExecutor):
         config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         config.compilation_config.mode = CompilationMode.NONE
         config.kernel_config.enable_jit_warmup = False
+        assert isinstance(config.additional_config, dict)
+        config.additional_config = dict(
+            config.additional_config, rapidserve_role="prefill"
+        )
         config.parallel_config.worker_cls = (
             "vllm.v1.rapidserve.worker.SharedModelWorker"
         )
@@ -63,7 +85,7 @@ class PairedExecutor(UniProcExecutor):
                     "Paired execution requires dictionary additional_config"
                 )
             self.vllm_config.additional_config = dict(
-                options, rapidserve_weights=weights
+                options, rapidserve_weights=weights, rapidserve_role="decode"
             )
             self.vllm_config.parallel_config.worker_cls = (
                 config.parallel_config.worker_cls
@@ -155,8 +177,21 @@ class PairedExecutor(UniProcExecutor):
     def poll_prefills(self):
         results = []
         while self.connection.poll():
-            results.append(self._receive("prefill_done"))
+            kind, result = self.connection.recv()
+            if kind == "error":
+                raise RuntimeError(f"Prefill process failed:\n{result}")
+            if kind == "policy_done":
+                self.policy_ack = result
+            elif kind == "prefill_done":
+                results.append(result)
+            else:
+                raise RuntimeError(f"Unexpected prefill message: {kind}")
         return results
+
+    def send_policy(self, epoch, fraction):
+        assert self.outbound is not None
+        self.policy_ack = None
+        self.outbound.put_nowait(("policy", (epoch, fraction)))
 
     def check_health(self):
         if self.send_error is not None:
@@ -169,12 +204,15 @@ class PairedExecutor(UniProcExecutor):
             "sleep",
             "wake_up",
             "release_kv_cache_memory",
+            "discard",
+            "reload_weights",
+            "execute_dummy_batch",
             "update_weights",
             "start_weight_update",
             "finish_weight_update",
         ):
             raise ValueError(f"Paired execution does not support {method}")
-        if method == "synchronize_device" and self.outbound is None:
+        if method == "synchronize_device" and getattr(self, "outbound", None) is None:
             self.prefill_rpc(method)
         return super().collective_rpc(method, *args, **kwargs)
 

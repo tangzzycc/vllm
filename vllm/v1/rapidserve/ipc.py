@@ -125,6 +125,8 @@ def validate_shared_model(config: VllmConfig) -> None:
         or config.offload_config.uva.cpu_offload_gb > 0
         or config.offload_config.prefetch.offload_group_size > 0
         or config.weight_transfer_config is not None
+        or config.watermark_config is not None
+        or model.enable_trace_replay
     ):
         raise ValueError(
             "Shared MRV2 storage requires single-GPU resident dense text models"

@@ -143,6 +143,8 @@ def has_compiled_submodule(model: nn.Module) -> bool:
 
 
 class CudaGraphManager:
+    capture_stream: torch.cuda.Stream | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -432,7 +434,10 @@ class CudaGraphManager:
             progress_bar_desc: Description shown on the capture progress bar.
 
         """
-        with graph_capture(device=self.device), ExitStack() as stack:
+        with (
+            graph_capture(device=self.device, stream=self.capture_stream),
+            ExitStack() as stack,
+        ):
             if self.ubatch_runner is not None:
                 # Join parked threads on failure to avoid blocking later captures.
                 stack.callback(self.ubatch_runner.abort_pending_run)

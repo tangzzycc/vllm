@@ -35,6 +35,9 @@ class PairedCoordinator:
         self.registered = set()
         self.cancel_sent: set[int] = set()
         self.buffered: dict[int, EngineCoreOutputs] = {}
+        self.policy_epoch = 0
+        self.policy_target: float | None = None
+        self.policy_dispatched = False
         self.core.model_executor.prefill_rpc("start")
 
     @staticmethod
@@ -88,11 +91,27 @@ class PairedCoordinator:
                 self.merge(outputs, scheduler.complete_decode(batch, model_output))
                 progressed = True
         # Bound the P queue by the global admission cap owned by D.
-        works = scheduler.grant_prefills() if executor.can_send() else []
+        if self.policy_target is not None and not scheduler.leases and not self.pending:
+            if not self.policy_dispatched and executor.can_send():
+                executor.send_policy(self.policy_epoch, self.policy_target)
+                self.policy_dispatched = True
+            elif self.policy_dispatched and executor.policy_ack == self.policy_epoch:
+                executor.driver_worker.worker.set_resource_policy(
+                    self.policy_epoch, self.policy_target
+                )
+                self.policy_target = None
+                self.policy_dispatched = False
+                scheduler.resource_policy_pending = False
+                progressed = True
+        works = (
+            scheduler.grant_prefills()
+            if self.policy_target is None and executor.can_send()
+            else []
+        )
         if works:
             executor.send_prefills(works)
             progressed = True
-        if len(self.pending) < self.depth:
+        if self.policy_target is None and len(self.pending) < self.depth:
             batch = scheduler.schedule()
             self.registered.difference_update(batch.finished_req_ids)
             self.registered.difference_update(batch.preempted_req_ids or set())
@@ -150,6 +169,15 @@ class PairedCoordinator:
         if not progressed and scheduler.has_requests():
             time.sleep(0.0001)
         return outputs, progressed
+
+    def request_resource_policy(self, fraction: float):
+        if self.policy_target is not None:
+            raise ValueError("A resource policy change is already pending")
+        if fraction and not 0 < fraction < 1:
+            raise ValueError("CU fraction must be zero or between zero and one")
+        self.policy_epoch += 1
+        self.policy_target = fraction
+        self.core.scheduler.resource_policy_pending = True
 
     def drain(self):
         """Wait for submitted GPU work before an in-process pause completes."""
