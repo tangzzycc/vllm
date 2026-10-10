@@ -7544,3 +7544,73 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+def test_paired_prefill_lease_pins_kv_until_completion():
+    """Cancellation cannot reuse blocks an external prefill may still write."""
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    scheduler = create_scheduler(scheduler_cls=DecodeScheduler)
+    request = create_requests(1)[0]
+    request.sampling_params.temperature = 0
+    scheduler.add_request(request)
+    work = scheduler.grant_prefills()[0]
+    pool = scheduler.kv_cache_manager.block_pool
+    before = pool.get_num_free_blocks()
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    assert pool.get_num_free_blocks() == before
+    assert scheduler.has_requests()
+    result = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1000]],
+    )
+    scheduler.complete_prefill(work, result)
+    assert pool.get_num_free_blocks() > before
+    assert request.request_id not in scheduler.requests
+    assert scheduler.complete_prefill(work, result) == {}
+
+
+def test_paired_decode_does_not_wait_for_other_prefill_leases():
+    """Decode continues while a different request is held by the P process."""
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    scheduler = create_scheduler(scheduler_cls=DecodeScheduler)
+    first, second = create_requests(2)
+    first.sampling_params.temperature = 0
+    second.sampling_params.temperature = 0
+    scheduler.add_request(first)
+    work = scheduler.grant_prefills()[0]
+    result = ModelRunnerOutput(
+        req_ids=[first.request_id],
+        req_id_to_index={first.request_id: 0},
+        sampled_token_ids=[[1000]],
+    )
+    scheduler.complete_prefill(work, result)
+    scheduler.add_request(second)
+    scheduler.grant_prefills()
+    batch = scheduler.schedule()
+    assert batch.num_scheduled_tokens == {first.request_id: 1}
+    assert second.request_id in scheduler.leases
+
+
+def test_paired_stale_prefill_completion_cannot_release_new_lease():
+    """An old work sequence must not consume the current block assignment."""
+    from dataclasses import replace
+
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    scheduler = create_scheduler(scheduler_cls=DecodeScheduler)
+    request = create_requests(1)[0]
+    request.sampling_params.temperature = 0
+    scheduler.add_request(request)
+    work = scheduler.grant_prefills()[0]
+    stale = replace(work, sequence=work.sequence - 1)
+    result = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1000]],
+    )
+    assert scheduler.complete_prefill(stale, result) == {}
+    assert request.request_id in scheduler.leases
+    assert not scheduler.schedule().num_scheduled_tokens

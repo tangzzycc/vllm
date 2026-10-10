@@ -647,6 +647,9 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if not self._is_request_eligible(request):
+                req_index += 1
+                continue
             if input_budget <= draft_slots:
                 break
 
@@ -886,7 +889,11 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
+        if (
+            not preempted_reqs
+            and self._pause_state != PauseState.PAUSED_ALL
+            and self._can_schedule_waiting()
+        ):
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
 
@@ -1554,6 +1561,12 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _is_request_eligible(self, request: Request) -> bool:
+        return True
+
+    def _can_schedule_waiting(self) -> bool:
+        return True
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
