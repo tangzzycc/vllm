@@ -7614,3 +7614,25 @@ def test_paired_stale_prefill_completion_cannot_release_new_lease():
     assert scheduler.complete_prefill(stale, result) == {}
     assert request.request_id in scheduler.leases
     assert not scheduler.schedule().num_scheduled_tokens
+
+
+def test_paired_first_token_finishes_without_decode():
+    """A one-token request completes at handoff and ignores duplicate messages."""
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    scheduler = create_scheduler(scheduler_cls=DecodeScheduler)
+    request = create_requests(1)[0]
+    request.sampling_params.temperature = 0
+    request.max_tokens = request.sampling_params.max_tokens = 1
+    scheduler.add_request(request)
+    work = scheduler.grant_prefills()[0]
+    result = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1000]],
+    )
+    outputs = scheduler.complete_prefill(work, result)
+    assert outputs[request.client_index].outputs[0].new_token_ids == [1000]
+    assert request.is_finished()
+    assert scheduler.complete_prefill(work, result) == {}
+    assert not scheduler.schedule().num_scheduled_tokens

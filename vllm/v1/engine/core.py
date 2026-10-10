@@ -137,6 +137,14 @@ class EngineCore:
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
 
+        paired = isinstance(
+            vllm_config.additional_config, dict
+        ) and vllm_config.additional_config.get("rapidserve", False)
+        if paired:
+            from vllm.v1.rapidserve.engine import configure
+
+            executor_class = configure(vllm_config)
+
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
         self._pooler_config_logged = False
@@ -240,6 +248,11 @@ class EngineCore:
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
+        if paired:
+            from vllm.v1.rapidserve.engine import PairedCoordinator
+
+            self.paired = PairedCoordinator(self)
+            self.step_fn = self.paired.step
 
         self._idle_state_callbacks: list[Callable] = []
 

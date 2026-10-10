@@ -96,6 +96,15 @@ class PairedExecutor(UniProcExecutor):
         self.prefill_rpc("compile_or_warm_up_model")
         super().compile_or_warm_up_model()
 
+    def send_prefills(self, works):
+        self.connection.send(("work", (works,)))
+
+    def poll_prefills(self):
+        results = []
+        while self.connection.poll():
+            results.append(self._receive("prefill_done"))
+        return results
+
     def check_health(self):
         if self.prefill_process is None or not self.prefill_process.is_alive():
             raise RuntimeError("Prefill process exited")
