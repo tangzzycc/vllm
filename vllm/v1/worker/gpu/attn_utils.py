@@ -385,10 +385,13 @@ def init_kv_cache(
     *,
     block_tables: "BlockTables | None" = None,
     attn_groups: Iterable[AttentionGroup] = (),
+    shared_kv_caches: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     allocation_context = kv_cache_allocation_context or nullcontext()
     with allocation_context:
-        if vllm_config.attention_config.hisparse_config is not None:
+        if shared_kv_caches is not None:
+            kv_caches = shared_kv_caches
+        elif vllm_config.attention_config.hisparse_config is not None:
             assert block_tables is not None
             kv_caches = init_hisparse_kv_cache(
                 kv_cache_config,

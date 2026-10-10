@@ -170,3 +170,35 @@ def test_kv_wake_does_not_run_model_runner_recovery() -> None:
         for actual, expected in zip(runner.layout_tensors, layout_tensors, strict=True)
     )
     assert tuple(t.data_ptr() for t in runner.layout_tensors) == layout_ptrs
+
+
+def test_imported_mrv2_kv_is_bound_without_allocating(monkeypatch) -> None:
+    """An IPC consumer binds its own layers to the externally owned KV views."""
+    caches = {"layer": torch.empty(1)}
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="test")),
+    )
+    forward_context = {"layer": object()}
+    bound = {}
+
+    def allocate(*args, **kwargs):
+        pytest.fail("An IPC consumer must not allocate a second KV cache")
+
+    def bind(views, layers, *args, **kwargs):
+        bound.update(views)
+        assert layers is forward_context
+
+    monkeypatch.setattr(attn_utils, "allocate_kv_cache", allocate)
+    monkeypatch.setattr(attn_utils, "get_shared_kv_cache_layers", lambda config: {})
+    monkeypatch.setattr(attn_utils, "map_kv_caches_to_kernel_blocks", lambda x, _: x)
+    monkeypatch.setattr(attn_utils, "bind_kv_cache_to_layers", bind)
+    result = attn_utils.init_kv_cache(
+        forward_context,
+        SimpleNamespace(kv_cache_groups=[]),
+        torch.device("cpu"),
+        [],
+        config,
+        shared_kv_caches=caches,
+    )
+    assert result is caches
+    assert bound["layer"] is caches["layer"]

@@ -598,7 +598,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager | None = None,
-        shared_kv_caches: list[torch.Tensor] | None = None,
+        shared_kv_caches: dict[str, torch.Tensor] | None = None,
     ) -> None:
         if shared_kv_caches is not None:
             if self.vllm_config.kv_transfer_config is not None:
@@ -769,33 +769,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # to its own attention support.
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
-        if shared_kv_caches is None:
-            # Capture warmup providers that depend on allocated KV-cache strides.
-            with self.jit_warmup_registry.activate():
-                kv_caches_dict = init_kv_cache(
-                    self.compilation_config.static_forward_context,
-                    self.kv_cache_config,
-                    self.device,
-                    self.kernel_block_sizes,
-                    self.vllm_config,
-                    kv_cache_allocation_context=kv_cache_allocation_context,
-                    block_tables=self.block_tables,
-                    # Draft groups build their own metadata, so they map the views too.
-                    attn_groups=(
-                        g
-                        for groups in self.attn_groups
-                        + getattr(self.speculator, "attn_groups", [])
-                        for g in groups
-                    ),
-                )
-            self.kv_caches = [
-                cache
-                for cache in kv_caches_dict.values()
-                if cache.device == self.device
-            ]
-        else:
-            kv_caches_dict = {}
-            self.kv_caches = shared_kv_caches
+        # Capture warmup providers that depend on allocated KV-cache strides.
+        with self.jit_warmup_registry.activate():
+            kv_caches_dict = init_kv_cache(
+                self.compilation_config.static_forward_context,
+                self.kv_cache_config,
+                self.device,
+                self.kernel_block_sizes,
+                self.vllm_config,
+                kv_cache_allocation_context=kv_cache_allocation_context,
+                block_tables=self.block_tables,
+                attn_groups=(
+                    g
+                    for groups in self.attn_groups
+                    + getattr(self.speculator, "attn_groups", [])
+                    for g in groups
+                ),
+                shared_kv_caches=shared_kv_caches,
+            )
+        self.kv_caches = [
+            cache for cache in kv_caches_dict.values() if cache.device == self.device
+        ]
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
