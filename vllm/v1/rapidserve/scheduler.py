@@ -118,6 +118,8 @@ class DecodeScheduler(Scheduler):
         token_budget = self.max_num_scheduled_tokens
         input_budget = self.scheduler_config.max_num_batched_tokens
         threshold = self.scheduler_config.long_prefill_token_threshold
+        admission_cap = self.max_num_active_reqs
+        self.max_num_active_reqs = max(0, admission_cap - len(self.retired))
         full_budget = self.max_model_len * self.max_num_running_reqs
         self.max_num_scheduled_tokens = full_budget
         self.scheduler_config.max_num_batched_tokens = full_budget
@@ -129,6 +131,7 @@ class DecodeScheduler(Scheduler):
             self.max_num_scheduled_tokens = token_budget
             self.scheduler_config.max_num_batched_tokens = input_budget
             self.scheduler_config.long_prefill_token_threshold = threshold
+            self.max_num_active_reqs = admission_cap
         works = []
         for req_id, count in output.num_scheduled_tokens.items():
             request = self.requests[req_id]

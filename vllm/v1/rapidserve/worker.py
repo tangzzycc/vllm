@@ -28,8 +28,9 @@ class SharedModelWorker(Worker):
         self.default_stream = torch.cuda.Stream(device=self.device)
         self.default_stream.wait_stream(torch.cuda.current_stream(self.device))
         self.capture_stream = torch.cuda.Stream(device=self.device)
-        self.graphs: dict[float, ModelCudaGraphManager] = {}
-        self.streams: dict[float, Any] = {}
+        self.graphs: dict[tuple[int, ...], ModelCudaGraphManager] = {}
+        self.streams: dict[tuple[int, ...], Any] = {}
+        self.resource_key: tuple[int, ...] = ()
         options = self.vllm_config.additional_config
         assert isinstance(options, dict)
         self.cu_fraction = float(options.get("rapidserve_cu_fraction", 0))
@@ -40,23 +41,28 @@ class SharedModelWorker(Worker):
         if epoch < self.resource_epoch:
             raise ValueError("Stale resource policy epoch")
         runner = cast(GPUModelRunner, self.model_runner)
+        key: tuple[int, ...] = ()
+        if fraction:
+            total = torch.cuda.get_device_properties(self.device).multi_processor_count
+            masks = partition_cus(total, fraction)
+            options = self.vllm_config.additional_config
+            assert isinstance(options, dict)
+            key = tuple(masks[int(options["rapidserve_role"] == "decode")])
+        if capture and key == self.resource_key:
+            self.cu_fraction = fraction
+            self.resource_epoch = epoch
+            return epoch
         torch.accelerator.synchronize()
         if (
             capture
             and runner.cudagraph_manager is not None
             and runner.cudagraph_manager.cudagraph_mode
         ):
-            self.graphs[self.cu_fraction] = runner.cudagraph_manager
-        owner = self.streams.get(fraction)
+            self.graphs[self.resource_key] = runner.cudagraph_manager
+        owner = self.streams.get(key)
         if fraction and owner is None:
-            total = torch.cuda.get_device_properties(self.device).multi_processor_count
-            masks = partition_cus(total, fraction)
-            options = self.vllm_config.additional_config
-            assert isinstance(options, dict)
-            role = options["rapidserve_role"]
-            mask = masks[int(role == "decode")]
-            owner = current_platform.create_cu_masked_stream(mask, self.device)
-            self.streams[fraction] = owner
+            owner = current_platform.create_cu_masked_stream(list(key), self.device)
+            self.streams[key] = owner
         stream = owner.stream if owner is not None else self.default_stream
         torch.cuda.set_stream(stream)
         runner.main_stream = stream
@@ -66,7 +72,7 @@ class SharedModelWorker(Worker):
             and runner.cudagraph_manager is not None
             and runner.cudagraph_manager.cudagraph_mode
         ):
-            manager = self.graphs.get(fraction)
+            manager = self.graphs.get(key)
             if manager is None:
                 manager = ModelCudaGraphManager(
                     self.vllm_config,
@@ -79,9 +85,10 @@ class SharedModelWorker(Worker):
                 manager.capture_stream = self.capture_stream
                 manager.pool = current_platform.graph_pool_handle()
                 runner.capture_model()
-                self.graphs[fraction] = manager
+                self.graphs[key] = manager
             runner.cudagraph_manager = manager
         self.cu_fraction = fraction
+        self.resource_key = key
         self.resource_epoch = epoch
         return epoch
 
@@ -157,9 +164,9 @@ class SharedModelWorker(Worker):
         )
 
     def shutdown(self) -> None:
+        super().shutdown()
         if hasattr(self, "graphs"):
             self.graphs.clear()
-        super().shutdown()
         if not hasattr(self, "default_stream"):
             return
         torch.cuda.set_stream(self.default_stream)

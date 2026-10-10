@@ -23,6 +23,7 @@ class PrefillEngine:
         self.last_sequence = 0
         self.session: str | None = None
         self.cancelled: set[int] = set()
+        self.resident: set[int] = set()
 
     def add(self, works):
         for work in works:
@@ -49,6 +50,7 @@ class PrefillEngine:
         cleanup.finished_req_ids = {work.request.req_id}
         self.worker.model_runner.finish_requests(cleanup)
         self.cancelled.discard(work.sequence)
+        self.resident.discard(work.sequence)
         self.connection.send(("prefill_done", (work.identity, result)))
 
     @torch.inference_mode()
@@ -101,6 +103,12 @@ class PrefillEngine:
                 self.finish(work, EMPTY_MODEL_RUNNER_OUTPUT)
                 progressed = True
                 continue
+            if (
+                work.sequence not in self.resident
+                and len(self.resident) >= self.worker.model_runner.max_num_reqs
+            ):
+                self.waiting.appendleft((work, computed))
+                break
             count = min(budget, work.num_tokens - computed)
             data = replace(
                 work.request,
@@ -110,6 +118,7 @@ class PrefillEngine:
             batch.num_scheduled_tokens[data.req_id] = count
             batch.total_num_scheduled_tokens += count
             selected.append((work, computed + count))
+            self.resident.add(work.sequence)
             budget -= count
         if not selected:
             return progressed

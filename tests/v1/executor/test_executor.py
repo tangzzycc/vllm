@@ -290,3 +290,122 @@ def test_paired_owner_error_waits_for_consumer_before_teardown(monkeypatch):
     assert order == ["export", "consumer-close", "owner-shutdown"]
     error = connection.send.call_args_list[-1].args[0]
     assert error[0] == "error" and "KV export failed" in error[1]
+
+
+def test_paired_consumer_shutdown_failure_still_closes_owner(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.v1.rapidserve.executor import PairedExecutor
+
+    executor = PairedExecutor.__new__(PairedExecutor)
+    executor.driver_worker = Mock()
+    executor.connection = Mock()
+    executor.prefill_process = Mock()
+    executor.prefill_process.is_alive.return_value = False
+    monkeypatch.setattr(
+        UniProcExecutor, "shutdown", Mock(side_effect=RuntimeError("GPU failed"))
+    )
+    connection, process = executor.connection, executor.prefill_process
+    with pytest.raises(RuntimeError, match="GPU failed"):
+        executor.shutdown()
+    connection.send.assert_called_once_with(("close", ()))
+    process.join.assert_called_once_with(10)
+    executor.shutdown()
+    connection.send.assert_called_once_with(("close", ()))
+
+
+def test_paired_prefill_waits_for_resident_slot_after_cancel(monkeypatch):
+    """P retires its old request before executing work admitted after cancellation."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import torch
+
+    from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+    from vllm.v1.rapidserve.prefill import PrefillEngine
+    from vllm.v1.rapidserve.scheduler import PrefillWork
+
+    runner = SimpleNamespace(
+        max_num_reqs=1,
+        max_num_tokens=8,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[None]),
+        finish_requests=Mock(),
+    )
+    worker = SimpleNamespace(
+        model_runner=runner, execute_model=Mock(), sample_tokens=lambda _: None
+    )
+    connection = Mock()
+    engine = PrefillEngine(worker, connection)
+    old = PrefillWork("session", 1, SimpleNamespace(req_id="old"), 8)
+    from vllm.v1.core.sched.output import NewRequestData
+
+    new = PrefillWork(
+        "session",
+        2,
+        NewRequestData("new", [1] * 8, [], None, None, ([1],), 0, None),
+        8,
+    )
+    event = Mock()
+    event.query.return_value = False
+    engine.session = "session"
+    engine.resident.add(old.sequence)
+    engine.pending.append(([(old, 8)], None, event))
+    engine.cancel([old.identity])
+    engine.add([new])
+    assert not engine.step()
+    worker.execute_model.assert_not_called()
+
+    event.query.return_value = True
+    monkeypatch.setattr(torch.cuda, "Event", Mock)
+    assert engine.step()
+    connection.send.assert_called_once_with(
+        ("prefill_done", (old.identity, EMPTY_MODEL_RUNNER_OUTPUT))
+    )
+    batch = worker.execute_model.call_args.args[0]
+    assert batch.num_scheduled_tokens == {"new": 8}
+
+
+@pytest.mark.parametrize("stage", ["manager", "scheduler", "ready"])
+def test_paired_initialization_failure_closes_executor(monkeypatch, stage):
+    """All startup stages after KV allocation must release the paired owner."""
+    from unittest.mock import Mock
+
+    from tests.v1.core.utils import create_scheduler
+    from vllm.v1.engine.core import EngineCore
+
+    scheduler = create_scheduler()
+    config = scheduler.vllm_config
+    config.additional_config = {"rapidserve": True}
+    executor = Mock()
+    monkeypatch.setattr(
+        "vllm.v1.rapidserve.engine.configure", lambda _: lambda _: executor
+    )
+    monkeypatch.setattr(
+        EngineCore,
+        "_initialize_kv_caches",
+        lambda *_: scheduler.kv_cache_manager.kv_cache_config,
+    )
+    error = RuntimeError("post-KV failure")
+    monkeypatch.setattr(
+        "vllm.v1.engine.core.StructuredOutputManager",
+        Mock(side_effect=error) if stage == "manager" else Mock(),
+    )
+    monkeypatch.setattr(
+        config.scheduler_config,
+        "get_scheduler_cls",
+        lambda: (
+            Mock(side_effect=error) if stage == "scheduler" else lambda **_: scheduler
+        ),
+    )
+    monkeypatch.setattr(
+        EngineCore, "_initialize_effective_attention_block_size", lambda _: None
+    )
+    monkeypatch.setattr(
+        "vllm.v1.rapidserve.engine.PairedCoordinator", Mock(side_effect=error)
+    )
+    cleanup = Mock()
+    monkeypatch.setattr("vllm.v1.engine.core.cleanup_dist_env_and_memory", cleanup)
+    with pytest.raises(RuntimeError, match="post-KV failure"):
+        EngineCore(config, Mock(), log_stats=False)
+    executor.shutdown.assert_called_once()
+    cleanup.assert_called_once()

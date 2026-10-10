@@ -218,26 +218,30 @@ class PairedExecutor(UniProcExecutor):
 
     def shutdown(self):
         self.shutting_down = True
-        if getattr(self, "driver_worker", None) is not None:
-            super().shutdown()
-            del self.driver_worker
-        connection = getattr(self, "connection", None)
-        process = getattr(self, "prefill_process", None)
-        if connection is not None:
-            if getattr(self, "outbound", None) is not None:
-                assert self.outbound is not None
-                with suppress(Exception):
-                    self.outbound.put(("close", ()), timeout=1)
-                if self.sender is not None:
-                    self.sender.join(1)
-            else:
-                with suppress(EOFError, BrokenPipeError, OSError):
-                    connection.send(("close", ()))
-            connection.close()
-            self.connection = None
-        if process is not None:
-            process.join(10)
-            if process.is_alive():
-                process.terminate()
+        try:
+            if getattr(self, "driver_worker", None) is not None:
+                try:
+                    super().shutdown()
+                finally:
+                    del self.driver_worker
+        finally:
+            connection = getattr(self, "connection", None)
+            process = getattr(self, "prefill_process", None)
+            if connection is not None:
+                if getattr(self, "outbound", None) is not None:
+                    assert self.outbound is not None
+                    with suppress(Exception):
+                        self.outbound.put(("close", ()), timeout=1)
+                    if self.sender is not None:
+                        self.sender.join(1)
+                else:
+                    with suppress(EOFError, BrokenPipeError, OSError):
+                        connection.send(("close", ()))
+                connection.close()
+                self.connection = None
+            if process is not None:
                 process.join(10)
-            self.prefill_process = None
+                if process.is_alive():
+                    process.terminate()
+                    process.join(10)
+                self.prefill_process = None

@@ -20,6 +20,7 @@ class TensorViews:
     views: dict[str, tuple[int, torch.dtype, tuple[int, ...], tuple[int, ...], int]]
 
     device_uuid: str
+    host_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     _owners: list[torch.Tensor] = field(default_factory=list, repr=False)
 
     def __getstate__(self):
@@ -27,6 +28,7 @@ class TensorViews:
             "storages": self.storages,
             "views": self.views,
             "device_uuid": self.device_uuid,
+            "host_tensors": self.host_tensors,
             "_owners": [],
         }
 
@@ -60,7 +62,7 @@ class TensorViews:
         device_uuid = str(
             torch.cuda.get_device_properties(next(iter(tensors.values())).device).uuid
         )
-        return cls(storages, views, device_uuid, owners)
+        return cls(storages, views, device_uuid, _owners=owners)
 
     def import_tensors(self, device: torch.device) -> dict[str, torch.Tensor]:
         if str(torch.cuda.get_device_properties(device).uuid) != self.device_uuid:
@@ -73,7 +75,7 @@ class TensorViews:
             tensor = torch.empty(0, dtype=torch.uint8, device=device)
             tensor.set_(storage, 0, (storage.nbytes(),), (1,))
             imported.append(tensor)
-        result = {}
+        result = {name: tensor.clone() for name, tensor in self.host_tensors.items()}
         for name, (index, dtype, shape, stride, offset) in self.views.items():
             tensor = torch.empty(0, dtype=dtype, device=device)
             tensor.set_(imported[index].untyped_storage(), offset, shape, stride)
@@ -90,14 +92,21 @@ def export_model(model: torch.nn.Module) -> TensorViews:
         {
             "buffer:" + name: buf.detach()
             for name, buf in model.named_buffers(remove_duplicate=False)
-            if buf.is_cuda
         }
     )
     for path, module in model.named_modules():
         for name, value in vars(module).items():
-            if isinstance(value, torch.Tensor) and value.is_cuda and name != "kv_cache":
+            if isinstance(value, torch.Tensor) and name != "kv_cache":
                 tensors[f"attribute:{path}.{name}"] = value.detach()
-    return TensorViews.export(tensors)
+    manifest = TensorViews.export(
+        {name: tensor for name, tensor in tensors.items() if tensor.is_cuda}
+    )
+    manifest.host_tensors = {
+        name: tensor.clone()
+        for name, tensor in tensors.items()
+        if tensor.device.type == "cpu"
+    }
+    return manifest
 
 
 def validate_shared_model(config: VllmConfig) -> None:
@@ -167,6 +176,14 @@ def import_model(config: VllmConfig, manifest: TensorViews) -> torch.nn.Module:
             setattr(module, name, tensor.clone())
     missing = [name for name, tensor in model.named_parameters() if tensor.is_meta]
     missing.extend(name for name, tensor in model.named_buffers() if tensor.is_meta)
+    for path, module in model.named_modules():
+        missing.extend(
+            f"{path}.{name}"
+            for name, tensor in vars(module).items()
+            if isinstance(tensor, torch.Tensor)
+            and tensor.is_meta
+            and name != "kv_cache"
+        )
     if missing:
         raise ValueError(f"IPC model has uninitialized tensors: {missing}")
     return model.eval()

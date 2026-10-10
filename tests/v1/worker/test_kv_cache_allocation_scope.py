@@ -217,3 +217,89 @@ def test_paired_cu_masks_partition_all_cu_pairs(total, fraction):
         if cu % 2:
             assert p == bool(prefill[(cu - 1) // 32] & (1 << ((cu - 1) % 32)))
     assert sum(word.bit_count() for word in prefill + decode) == total
+
+
+def test_paired_model_import_restores_host_tensors(monkeypatch):
+    """Meta construction must not leave host scales or CPU buffers uninitialized."""
+    from vllm.v1.rapidserve import ipc
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("scale", torch.tensor(0.25))
+            self.host_scale = torch.tensor(0.5)
+
+    source = Model()
+    manifest = ipc.TensorViews([], {}, "test")
+    monkeypatch.setattr(ipc.TensorViews, "export", lambda _: manifest)
+    exported = ipc.export_model(source)
+    monkeypatch.setattr(ipc, "validate_shared_model", lambda _: None)
+    monkeypatch.setattr(ipc, "initialize_model", lambda _: Model())
+    monkeypatch.setattr(
+        ipc.TensorViews,
+        "import_tensors",
+        lambda self, _: {name: t.clone() for name, t in self.host_tensors.items()},
+    )
+    config = SimpleNamespace(
+        device_config=SimpleNamespace(device=torch.device("cpu")),
+        model_config=SimpleNamespace(dtype=torch.float32),
+    )
+    imported = ipc.import_model(config, exported)
+    assert imported.scale.device.type == imported.host_scale.device.type == "cpu"
+    assert imported.scale.item() == 0.25
+    assert imported.host_scale.item() == 0.5
+    source.host_scale.fill_(9)
+    assert imported.host_scale.item() == 0.5
+
+
+def test_paired_equivalent_cu_policy_reuses_stream_and_graph(monkeypatch):
+    """Fractions rounded to the same mask cannot accumulate graph pools."""
+    from unittest.mock import Mock
+
+    from vllm.v1.rapidserve.worker import SharedModelWorker
+
+    worker = SharedModelWorker.__new__(SharedModelWorker)
+    worker.device = torch.device("cuda:0")
+    worker.resource_key = ()
+    worker.resource_epoch = 0
+    worker.cu_fraction = 0
+    worker.default_stream = Mock()
+    worker.capture_stream = Mock()
+    worker.streams = {}
+    worker.graphs = {}
+    worker.vllm_config = SimpleNamespace(
+        additional_config={"rapidserve_role": "decode"}
+    )
+    worker.model_runner = SimpleNamespace(
+        cudagraph_manager=SimpleNamespace(cudagraph_mode=True),
+        decode_query_len=1,
+        lora_capture_cases=[],
+        capture_model=Mock(),
+    )
+    synchronize = Mock()
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    monkeypatch.setattr(torch.cuda, "set_stream", Mock())
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=20),
+    )
+    create_stream = Mock(return_value=SimpleNamespace(stream=Mock()))
+    monkeypatch.setattr(
+        "vllm.v1.rapidserve.worker.current_platform.create_cu_masked_stream",
+        create_stream,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.rapidserve.worker.current_platform.graph_pool_handle", Mock()
+    )
+    monkeypatch.setattr(
+        "vllm.v1.rapidserve.worker.ModelCudaGraphManager",
+        lambda *_, **__: SimpleNamespace(cudagraph_mode=True),
+    )
+    worker.set_resource_policy(1, 0.501)
+    worker.set_resource_policy(2, 0.502)
+    create_stream.assert_called_once()
+    worker.model_runner.capture_model.assert_called_once()
+    synchronize.assert_called_once()
+    assert worker.resource_epoch == 2
+    assert len(worker.graphs) == 2

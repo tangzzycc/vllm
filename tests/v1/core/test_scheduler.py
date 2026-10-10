@@ -7654,6 +7654,30 @@ def test_paired_cancel_ack_drops_output_and_releases_lease():
     assert not scheduler.leases
 
 
+@pytest.mark.parametrize("is_async", [False, True])
+def test_paired_cancel_keeps_admission_credit_until_prefill_ack(is_async):
+    """A replacement request cannot overfill P while an aborted writer retires."""
+    from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+    from vllm.v1.rapidserve.scheduler import AsyncDecodeScheduler, DecodeScheduler
+
+    scheduler = create_scheduler(
+        max_num_seqs=1,
+        scheduler_cls=AsyncDecodeScheduler if is_async else DecodeScheduler,
+        async_scheduling=is_async,
+        use_v2_model_runner=True,
+    )
+    old, new = create_requests(2)
+    old.sampling_params.temperature = new.sampling_params.temperature = 0
+    scheduler.add_request(old)
+    work = scheduler.grant_prefills()[0]
+    scheduler.finish_requests(old.request_id, RequestStatus.FINISHED_ABORTED)
+    scheduler.add_request(new)
+
+    assert scheduler.grant_prefills() == []
+    scheduler.complete_prefill(work, EMPTY_MODEL_RUNNER_OUTPUT)
+    assert scheduler.grant_prefills()[0].request.req_id == new.request_id
+
+
 def test_paired_cache_reset_rejects_an_active_external_writer():
     """An explicit cache reset cannot bypass a P lease's reuse fence."""
     from vllm.v1.rapidserve.scheduler import DecodeScheduler
@@ -7722,3 +7746,41 @@ def test_paired_resource_policy_keeps_an_idle_engine_stepping():
     scheduler = DecodeScheduler.__new__(DecodeScheduler)
     scheduler.resource_policy_pending = True
     assert scheduler.has_requests()
+
+
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_paired_empty_step_does_not_rotate_pending_runner_buffers(cleanup):
+    """Empty steps only remove finished states, without executing sampler writes."""
+    from vllm.v1.rapidserve.engine import PairedCoordinator
+    from vllm.v1.rapidserve.executor import PairedExecutor
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    scheduler = create_scheduler(scheduler_cls=DecodeScheduler)
+    if cleanup:
+        request = create_requests(1)[0]
+        request.sampling_params.temperature = 0
+        scheduler.add_request(request)
+        scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    worker = Mock()
+    executor = PairedExecutor.__new__(PairedExecutor)
+    executor.check_health = Mock()
+    executor.prefill_rpc = Mock()
+    executor.can_send = lambda: False
+    executor.poll_prefills = lambda: []
+    executor.driver_worker = SimpleNamespace(worker=worker)
+    core = SimpleNamespace(
+        scheduler=scheduler,
+        model_executor=executor,
+        vllm_config=SimpleNamespace(max_concurrent_batches=2),
+        _process_aborts_queue=Mock(),
+    )
+    coordinator = PairedCoordinator(core)
+    event = Mock()
+    event.query.return_value = False
+    coordinator.pending.append((Mock(), None, event))
+    for _ in range(3):
+        coordinator.step()
+    worker.execute_model.assert_not_called()
+    worker.sample_tokens.assert_not_called()
+    assert len(coordinator.pending) == 1
+    assert worker.model_runner.finish_requests.call_count == int(cleanup)

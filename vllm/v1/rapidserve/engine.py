@@ -151,21 +151,25 @@ class PairedCoordinator:
                 )
                 self.registered.update(ids)
                 scheduler.decode_in_flight.update(batch.num_scheduled_tokens)
-            executor.driver_worker.worker.execute_model(batch)
-            result = executor.driver_worker.worker.sample_tokens(None)
-            if result is not None and not isinstance(result, AsyncOutput):
-                raise RuntimeError("Paired decode requires MRV2 asynchronous output")
             if batch.num_scheduled_tokens:
+                executor.driver_worker.worker.execute_model(batch)
+                result = executor.driver_worker.worker.sample_tokens(None)
+                if result is not None and not isinstance(result, AsyncOutput):
+                    raise RuntimeError(
+                        "Paired decode requires MRV2 asynchronous output"
+                    )
                 event = torch.cuda.Event()
                 event.record()
                 self.pending.append((batch, result, event))
                 progressed = True
-            elif batch.finished_req_ids:
-                self.merge(
-                    outputs,
-                    scheduler.update_from_output(batch, EMPTY_MODEL_RUNNER_OUTPUT),
-                )
-                progressed = True
+            else:
+                if batch.finished_req_ids or batch.preempted_req_ids:
+                    executor.driver_worker.worker.model_runner.finish_requests(batch)
+                    self.merge(
+                        outputs,
+                        scheduler.update_from_output(batch, EMPTY_MODEL_RUNNER_OUTPUT),
+                    )
+                    progressed = True
         if not progressed and scheduler.has_requests():
             time.sleep(0.0001)
         return outputs, progressed
