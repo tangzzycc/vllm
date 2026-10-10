@@ -19,7 +19,7 @@ class PrefillEngine:
         self.worker = worker
         self.connection = connection
         self.waiting: deque[tuple[PrefillWork, int]] = deque()
-        self.pending = None
+        self.pending: deque = deque()
         self.last_sequence = 0
         self.session: str | None = None
         self.cancelled: set[int] = set()
@@ -51,15 +51,19 @@ class PrefillEngine:
     def step(self):
         progressed = False
         if self.pending:
-            selected, output, event = self.pending
+            selected, output, event = self.pending[0]
             if not event.query() or (
                 output is not None and not output.copy_event.query()
             ):
-                return False
+                selected = []
+            else:
+                self.pending.popleft()
+                progressed = True
             result = (
-                output.get_output() if output is not None else EMPTY_MODEL_RUNNER_OUTPUT
+                output.get_output()
+                if selected and output is not None
+                else EMPTY_MODEL_RUNNER_OUTPUT
             )
-            self.pending = None
             for work, count in selected:
                 req_id = work.request.req_id
                 if work.sequence in self.cancelled:
@@ -75,8 +79,7 @@ class PrefillEngine:
                     sampled_token_ids=[result.sampled_token_ids[index]],
                 )
                 self.finish(work, sub)
-            progressed = True
-        if not self.waiting:
+        if not self.waiting or len(self.pending) >= 2:
             return progressed
         batch = SchedulerOutput.make_empty()
         batch.num_common_prefix_blocks = [0] * len(
@@ -112,7 +115,7 @@ class PrefillEngine:
             raise RuntimeError("Prefill requires MRV2 asynchronous output")
         event = torch.cuda.Event()
         event.record()
-        self.pending = (selected, output, event)
+        self.pending.append((selected, output, event))
         return True
 
     def has_work(self):

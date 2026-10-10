@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import Counter
 from dataclasses import dataclass, replace
 from uuid import uuid4
 
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.outputs import ModelRunnerOutput
@@ -38,7 +40,7 @@ class DecodeScheduler(Scheduler):
         self.sequence = 0
         self.leases: dict[str, tuple[PrefillWork, SchedulerOutput]] = {}
         self.retired: set[str] = set()
-        self.decode_in_flight: set[str] = set()
+        self.decode_in_flight: Counter[str] = Counter()
         self.prefill_selection = False
 
     def add_request(self, request: Request) -> None:
@@ -66,7 +68,13 @@ class DecodeScheduler(Scheduler):
     def _is_request_eligible(self, request: Request) -> bool:
         return (
             request.request_id not in self.leases
-            and request.request_id not in self.decode_in_flight
+            and (
+                request.request_id not in self.decode_in_flight
+                or (
+                    bool(self.scheduler_config.async_scheduling)
+                    and not self.prefill_selection
+                )
+            )
             and not request.is_finished()
             and self.needs_prefill(request) == self.prefill_selection
         )
@@ -167,7 +175,8 @@ class DecodeScheduler(Scheduler):
 
     def complete_decode(self, batch, result):
         ids = set(batch.num_scheduled_tokens)
-        self.decode_in_flight.difference_update(ids)
+        self.decode_in_flight.subtract(ids)
+        self.decode_in_flight += Counter()
         output = self.update_from_output(batch, result)
         self._release_retired(ids)
         return output
@@ -179,3 +188,7 @@ class DecodeScheduler(Scheduler):
         if reset_running_requests and (self.leases or self.decode_in_flight):
             raise ValueError("Cannot reset shared KV while GPU work is in flight")
         return super().reset_prefix_cache(reset_running_requests, reset_connector)
+
+
+class AsyncDecodeScheduler(DecodeScheduler, AsyncScheduler):
+    """Keep vLLM's GPU token placeholders while pinning external P writers."""

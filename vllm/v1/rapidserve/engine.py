@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import time
+from collections import deque
 from dataclasses import replace
 
 import torch
@@ -17,18 +18,20 @@ from vllm.v1.worker.gpu.async_utils import AsyncOutput
 def configure(config):
     if config.cache_config.enable_prefix_caching:
         raise ValueError("Paired execution does not yet support prefix caching")
-    if config.scheduler_config.async_scheduling:
-        raise ValueError("Paired eager execution initially requires sync scheduling")
-    config.scheduler_config.scheduler_cls = (
-        "vllm.v1.rapidserve.scheduler.DecodeScheduler"
+    name = (
+        "AsyncDecodeScheduler"
+        if config.scheduler_config.async_scheduling
+        else "DecodeScheduler"
     )
+    config.scheduler_config.scheduler_cls = f"vllm.v1.rapidserve.scheduler.{name}"
     return PairedExecutor
 
 
 class PairedCoordinator:
     def __init__(self, core):
         self.core = core
-        self.pending = None
+        self.pending: deque = deque()
+        self.depth = core.vllm_config.max_concurrent_batches
         self.registered = set()
         self.cancel_sent: set[int] = set()
         self.buffered: dict[int, EngineCoreOutputs] = {}
@@ -74,9 +77,9 @@ class PairedCoordinator:
             self.merge(outputs, scheduler.complete_prefill(work, result))
             progressed = True
         if self.pending:
-            batch, result, event = self.pending
+            batch, result, event = self.pending[0]
             if event.query() and (result is None or result.copy_event.query()):
-                self.pending = None
+                self.pending.popleft()
                 model_output = (
                     result.get_output()
                     if result is not None
@@ -89,7 +92,7 @@ class PairedCoordinator:
         if works:
             executor.send_prefills(works)
             progressed = True
-        if self.pending is None:
+        if len(self.pending) < self.depth:
             batch = scheduler.schedule()
             self.registered.difference_update(batch.finished_req_ids)
             self.registered.difference_update(batch.preempted_req_ids or set())
@@ -136,7 +139,7 @@ class PairedCoordinator:
             if batch.num_scheduled_tokens:
                 event = torch.cuda.Event()
                 event.record()
-                self.pending = (batch, result, event)
+                self.pending.append((batch, result, event))
                 progressed = True
             elif batch.finished_req_ids:
                 self.merge(

@@ -28,8 +28,6 @@ class PairedExecutor(UniProcExecutor):
         self.sender: Thread | None = None
         self.send_error: Exception | None = None
         validate_shared_model(self.vllm_config)
-        if not self.vllm_config.model_config.enforce_eager:
-            raise ValueError("Paired execution initially requires eager mode")
         if not self.vllm_config.cache_config.kv_cache_memory_bytes:
             raise ValueError(
                 "Paired execution currently requires a fixed KV byte budget"
@@ -40,8 +38,10 @@ class PairedExecutor(UniProcExecutor):
         config = deepcopy(self.vllm_config)
         config.compilation_config.static_forward_context = {}
         config.model_config.enforce_eager = True
+        config.scheduler_config.async_scheduling = False
         config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         config.compilation_config.mode = CompilationMode.NONE
+        config.kernel_config.enable_jit_warmup = False
         config.parallel_config.worker_cls = (
             "vllm.v1.rapidserve.worker.SharedModelWorker"
         )

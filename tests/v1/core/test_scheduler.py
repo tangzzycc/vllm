@@ -7666,3 +7666,38 @@ def test_paired_cache_reset_rejects_an_active_external_writer():
     with pytest.raises(ValueError, match="in flight"):
         scheduler.reset_prefix_cache(reset_running_requests=True)
     assert request.request_id in scheduler.leases
+
+
+def test_paired_async_decode_pins_blocks_until_last_batch_completes():
+    """Two queued decode batches keep cancellation's KV fenced until both settle."""
+    from vllm.v1.rapidserve.scheduler import AsyncDecodeScheduler
+
+    scheduler = create_scheduler(
+        scheduler_cls=AsyncDecodeScheduler,
+        async_scheduling=True,
+        use_v2_model_runner=True,
+    )
+    request = create_requests(1)[0]
+    request.sampling_params.temperature = 0
+    scheduler.add_request(request)
+    work = scheduler.grant_prefills()[0]
+    result = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[1000]],
+    )
+    scheduler.complete_prefill(work, result)
+    first = scheduler.schedule()
+    scheduler.decode_in_flight.update(first.num_scheduled_tokens)
+    second = scheduler.schedule()
+    scheduler.decode_in_flight.update(second.num_scheduled_tokens)
+    assert request.num_output_placeholders == 2
+    assert scheduler.decode_in_flight[request.request_id] == 2
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    before = scheduler.kv_cache_manager.block_pool.get_num_free_blocks()
+    scheduler.complete_decode(first, result)
+    assert request.request_id in scheduler.requests
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == before
+    scheduler.complete_decode(second, result)
+    assert request.request_id not in scheduler.requests
+    assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() > before
