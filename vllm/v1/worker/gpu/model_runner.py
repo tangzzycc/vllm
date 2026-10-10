@@ -419,6 +419,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             time_after_load - time_before_load,
         )
 
+        self.initialize_model_components()
+        eplb_models_added |= self.eplb.maybe_register_model(
+            self.model, self.model_config
+        )
+        self.eplb.maybe_start_async_loop(eplb_models_added, load_dummy_weights)
+        if not self.is_first_pp_rank:
+            # Keep the received tensor storage stable for CUDA graph capture.
+            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                batch_size=self.max_num_tokens,
+                dtype=self.model_config.dtype,
+                device=self.device,
+            )
+        get_offloader().post_init()
+        if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
+            compile_model_with_stock_torch(self.model, self.vllm_config)
+
+    def initialize_model_components(self) -> None:
+        """Initialize runner-local state after a model has been loaded."""
         # Initialize the components that require the model.
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
@@ -517,26 +535,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
-        eplb_models_added |= self.eplb.maybe_register_model(
-            self.model, self.model_config
-        )
-        self.eplb.maybe_start_async_loop(eplb_models_added, load_dummy_weights)
-
-        if not self.is_first_pp_rank:
-            # For non-first PP ranks, create intermediate tensors sized
-            # for the max capture size so they can be sliced per batch.
-            # Save as persistent member so runtime can copy received data
-            # into the same addresses that the CUDA graphs captured.
-            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
-                batch_size=self.max_num_tokens,
-                dtype=self.model_config.dtype,
-                device=self.device,
-            )
-
-        get_offloader().post_init()
-
-        if self.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE:
-            compile_model_with_stock_torch(self.model, self.vllm_config)
 
     @property
     def dp_size(self) -> int:
@@ -600,7 +598,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_cache_config: KVCacheConfig,
         is_profiling: bool = False,
         kv_cache_allocation_context: AbstractContextManager | None = None,
+        shared_kv_caches: list[torch.Tensor] | None = None,
     ) -> None:
+        if shared_kv_caches is not None:
+            if self.vllm_config.kv_transfer_config is not None:
+                raise ValueError("Shared runner KV caches do not support KV transfer")
+            if self.vllm_config.attention_config.hisparse_config is not None:
+                raise ValueError("Shared runner KV caches do not support HiSparse")
+            if kv_cache_allocation_context is not None or is_profiling:
+                raise ValueError("Shared KV caches must already be allocated and bound")
         # GPUWorker finalizes the PD interleave before KV cache initialization.
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
@@ -763,27 +769,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # to its own attention support.
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
-        # Capture warmup providers that depend on allocated KV-cache strides.
-        with self.jit_warmup_registry.activate():
-            kv_caches_dict = init_kv_cache(
-                self.compilation_config.static_forward_context,
-                self.kv_cache_config,
-                self.device,
-                self.kernel_block_sizes,
-                self.vllm_config,
-                kv_cache_allocation_context=kv_cache_allocation_context,
-                block_tables=self.block_tables,
-                # Draft groups build their own metadata, so they map the views too.
-                attn_groups=(
-                    g
-                    for groups in self.attn_groups
-                    + getattr(self.speculator, "attn_groups", [])
-                    for g in groups
-                ),
-            )
-        self.kv_caches = [
-            cache for cache in kv_caches_dict.values() if cache.device == self.device
-        ]
+        if shared_kv_caches is None:
+            # Capture warmup providers that depend on allocated KV-cache strides.
+            with self.jit_warmup_registry.activate():
+                kv_caches_dict = init_kv_cache(
+                    self.compilation_config.static_forward_context,
+                    self.kv_cache_config,
+                    self.device,
+                    self.kernel_block_sizes,
+                    self.vllm_config,
+                    kv_cache_allocation_context=kv_cache_allocation_context,
+                    block_tables=self.block_tables,
+                    # Draft groups build their own metadata, so they map the views too.
+                    attn_groups=(
+                        g
+                        for groups in self.attn_groups
+                        + getattr(self.speculator, "attn_groups", [])
+                        for g in groups
+                    ),
+                )
+            self.kv_caches = [
+                cache
+                for cache in kv_caches_dict.values()
+                if cache.device == self.device
+            ]
+        else:
+            kv_caches_dict = {}
+            self.kv_caches = shared_kv_caches
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
