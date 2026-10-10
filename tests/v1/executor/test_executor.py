@@ -205,3 +205,38 @@ def test_custom_executor_async(distributed_executor_backend, tmp_path):
         assert os.path.exists(".marker")
     finally:
         os.chdir(cwd)
+
+
+def test_paired_executor_surfaces_prefill_bootstrap_error():
+    """A failed allocation owner cannot leave decode waiting for READY."""
+    from unittest.mock import Mock
+
+    from vllm.v1.rapidserve.executor import PairedExecutor
+
+    executor = PairedExecutor.__new__(PairedExecutor)
+    executor.connection = Mock()
+    executor.connection.poll.return_value = True
+    executor.connection.recv.return_value = ("error", "weight import failed")
+    with pytest.raises(RuntimeError, match="weight import failed"):
+        executor._receive("weights")
+
+
+def test_paired_executor_closes_consumer_before_allocation_owner(monkeypatch):
+    """The owner remains alive until decode releases its IPC mappings."""
+    from unittest.mock import Mock
+
+    from vllm.v1.rapidserve.executor import PairedExecutor
+
+    order = []
+    executor = PairedExecutor.__new__(PairedExecutor)
+    executor.driver_worker = Mock()
+    executor.connection = Mock()
+    executor.connection.send.side_effect = lambda _: order.append("owner-close")
+    executor.prefill_process = Mock()
+    executor.prefill_process.is_alive.return_value = False
+    monkeypatch.setattr(
+        UniProcExecutor, "shutdown", lambda _: order.append("consumer-close")
+    )
+    executor.shutdown()
+    executor.shutdown()
+    assert order == ["consumer-close", "owner-close"]

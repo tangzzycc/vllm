@@ -5,6 +5,7 @@ from typing import cast
 
 from vllm.config import set_current_vllm_config
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.rapidserve.ipc import TensorViews, export_model, import_model
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
@@ -46,6 +47,9 @@ class SharedModelWorker(Worker):
         return self._kv_export
 
     def import_kv(self, config, manifest: TensorViews) -> None:
+        if config.kv_cache_layout is not None:
+            record_kv_cache_layout(self.cache_config, config.kv_cache_layout)
+        self.cache_config.num_gpu_blocks = config.num_blocks
         cast(GPUModelRunner, self.model_runner).initialize_kv_cache(
             config, shared_kv_caches=manifest.import_tensors(self.device)
         )
