@@ -32,6 +32,8 @@ class PairedExecutor(UniProcExecutor):
         self.sender: Thread | None = None
         self.send_error: Exception | None = None
         validate_shared_model(self.vllm_config)
+        if self.vllm_config.model_config.is_moe:
+            self.vllm_config.kernel_config.moe_backend = "triton"
         if current_platform.is_rocm():
             # HIP's parallel graph queues do not inherit the launch stream CU mask.
             for name, value in (
@@ -96,8 +98,11 @@ class PairedExecutor(UniProcExecutor):
             self.vllm_config.parallel_config.worker_cls = (
                 config.parallel_config.worker_cls
             )
+            total_memory = current_platform.get_device_total_memory()
+            shared_bytes = sum(storage[2] for storage in weights.storages)
             self.vllm_config.cache_config.gpu_memory_utilization = min(
-                self.vllm_config.cache_config.gpu_memory_utilization, 0.5
+                self.vllm_config.cache_config.gpu_memory_utilization,
+                0.5 * (total_memory - shared_bytes) / total_memory,
             )
             super()._init_executor()
         except BaseException:

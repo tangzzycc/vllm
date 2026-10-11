@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 from typing import Any, cast
 
 import torch
@@ -168,7 +169,8 @@ class SharedModelWorker(Worker):
             return
         with set_current_vllm_config(self.vllm_config):
             runner = cast(GPUModelRunner, self.model_runner)
-            runner.model = import_model(self.vllm_config, manifest)
+            with runner.jit_warmup_registry.activate():
+                runner.model = import_model(self.vllm_config, manifest)
             runner.model_memory_usage = 0
             runner.initialize_model_components()
         set_torch_threads_for_runtime()
@@ -210,3 +212,4 @@ class SharedModelWorker(Worker):
         self.stream_owner = None
         self._weight_export = None
         self._kv_export = None
+        gc.collect()

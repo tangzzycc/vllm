@@ -199,6 +199,37 @@ Some attention backends also materialize derived state, such as scheduler metada
 
 For draft models that advance positions, the fused path is enabled only when every draft attention group declares `supports_draft_decode_metadata_update`. Otherwise, MRV2 falls back to rebuilding attention metadata between draft steps. Draft models that keep positions fixed do not require this update. Before enabling a backend, developers must audit all derived metadata, including state inherited from parent builders or owned by auxiliary attention backends.
 
+### Experimental Paired Prefill and Decode
+
+The experimental RapidServe executor runs prefill and decode in separate
+processes on one GPU. Prefill owns the physical model weights and KV cache;
+decode imports their storage through IPC and owns logical KV block allocation.
+Each process uses its own MRV2 request state, workspace, sampler, and graph
+manager. Prefill completion publishes KV writes before decode consumes them.
+
+Shared MoE execution currently supports resident, unquantized Qwen3 MoE models
+with the Triton MoE backend. The executor resolves `moe_backend="auto"` to
+Triton for both processes. Decode constructs the model on meta, attaches the
+already processed expert weights, and calls the existing model-loader
+post-processing entrypoint under `weights_already_processed()`. This rebuilds
+the local MoE kernel without padding, converting, or copying expert weights.
+Model construction also registers kernel warmup providers in the decode
+runner's registry before graph capture.
+
+Enable the executor through
+`additional_config={"rapidserve": True, "rapidserve_cu_fraction": 0}` with
+`VLLM_USE_V2_MODEL_RUNNER=1` and `VLLM_WORKER_MULTIPROC_METHOD=spawn`. A fixed
+`kv_cache_memory_bytes` budget and disabled prefix caching are required.
+`rapidserve_prefill_max_num_batched_tokens` controls the independent prefill
+token budget. A zero CU fraction uses the full GPU for both roles; ROCm can
+also partition CUs with a fraction between zero and one.
+
+Quantized models, hybrid and multimodal models, speculative decoding, LoRA,
+and multi-GPU execution remain unsupported. EPLB and elastic EP are rejected
+because independent processes cannot safely reorder shared expert weights.
+Throughput benefits depend on model size, batch composition, and hardware;
+overlapping execution alone does not establish a throughput improvement.
+
 ## Development Philosophy
 
 MRV2 changes should meet a higher code quality bar. As feature gaps with V1 are filled, features should be reconsidered from first principles in the MRV2 design context instead of quickly porting V1 behavior.

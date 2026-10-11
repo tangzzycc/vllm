@@ -27,6 +27,30 @@ from vllm.v1.executor.uniproc_executor import (
 class Mock: ...
 
 
+@pytest.mark.parametrize("backend", ["auto", "triton", "aiter"])
+def test_paired_moe_support_requires_a_compatible_backend(monkeypatch, backend):
+    """Qwen3 MoE can share weights; unverified weight layouts remain rejected."""
+    from vllm.v1.rapidserve.ipc import validate_shared_model
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = EngineArgs(
+        model="Qwen/Qwen3-30B-A3B",
+    ).create_engine_config()
+    config.kernel_config.moe_backend = backend
+    if backend == "aiter":
+        with pytest.raises(ValueError, match="Qwen3 MoE with Triton"):
+            validate_shared_model(config)
+    else:
+        validate_shared_model(config)
+        config.model_config.hf_text_config.model_type = "other_moe"
+        with pytest.raises(ValueError, match="Qwen3 MoE with Triton"):
+            validate_shared_model(config)
+        config.model_config.hf_text_config.model_type = "qwen3_moe"
+        config.parallel_config.enable_eplb = True
+        with pytest.raises(ValueError, match="single-GPU resident"):
+            validate_shared_model(config)
+
+
 @pytest.mark.parametrize(
     "chunked, expected", [(True, {"a": 6, "b": 2}), (False, {"a": 6})]
 )

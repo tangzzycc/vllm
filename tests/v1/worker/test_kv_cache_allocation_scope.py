@@ -242,7 +242,7 @@ def test_paired_model_import_restores_host_tensors(monkeypatch):
     )
     config = SimpleNamespace(
         device_config=SimpleNamespace(device=torch.device("cpu")),
-        model_config=SimpleNamespace(dtype=torch.float32),
+        model_config=SimpleNamespace(dtype=torch.float32, is_moe=False),
     )
     imported = ipc.import_model(config, exported)
     assert imported.scale.device.type == imported.host_scale.device.type == "cpu"
@@ -250,6 +250,81 @@ def test_paired_model_import_restores_host_tensors(monkeypatch):
     assert imported.host_scale.item() == 0.5
     source.host_scale.fill_(9)
     assert imported.host_scale.item() == 0.5
+
+
+def test_paired_moe_import_rebuilds_kernel_without_repacking_weights(monkeypatch):
+    """IPC import preserves runtime-format expert storage and initializes execution."""
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+    from vllm.model_executor.utils import is_weights_pre_processed
+    from vllm.v1.rapidserve import ipc
+
+    class Method(UnquantizedFusedMoEMethod):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.supports_pre_processed_weights = True
+            self.moe_kernel = None
+
+        def _init_moe_kernel(self, layer):
+            assert is_weights_pre_processed()
+            assert not layer.weight.is_meta
+            self.moe_kernel = lambda x: x @ layer.weight
+
+        def _maybe_pad_weight(self, weight):
+            pytest.fail("Imported expert weights must not be padded or repacked")
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(2, 3))
+            self.quant_method = Method()
+
+    weight = torch.arange(6, dtype=torch.float32).reshape(3, 2).t()
+    original = weight.clone()
+    manifest = ipc.TensorViews([], {}, "test")
+    monkeypatch.setattr(ipc, "validate_shared_model", lambda _: None)
+    monkeypatch.setattr(ipc, "initialize_model", lambda _: Model())
+    monkeypatch.setattr(
+        ipc.TensorViews, "import_tensors", lambda *_: {"parameter:weight": weight}
+    )
+    config = SimpleNamespace(
+        device_config=SimpleNamespace(device=torch.device("cpu")),
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            is_moe=True,
+            word_embeddings_untied_by_checkpoint=False,
+            quantization=None,
+        ),
+    )
+    imported = ipc.import_model(config, manifest)
+    assert imported.weight.data_ptr() == weight.data_ptr()
+    assert imported.weight.stride() == weight.stride()
+    torch.testing.assert_close(weight, original)
+    torch.testing.assert_close(
+        imported.quant_method.moe_kernel(torch.ones(2)), original.sum(dim=0)
+    )
+    assert not is_weights_pre_processed()
+
+
+def test_paired_shutdown_collects_imported_model_cycles(monkeypatch):
+    """MoE model cycles must release IPC views before the owner is closed."""
+    from weakref import ref
+
+    from vllm.v1.rapidserve.worker import SharedModelWorker
+
+    worker = SharedModelWorker.__new__(SharedModelWorker)
+    worker.streams = {}
+    worker.default_stream = object()
+    model = torch.nn.Module()
+    model.parent = model
+    reference = ref(model)
+    worker.model = model
+    del model
+    monkeypatch.setattr(Worker, "shutdown", lambda self: delattr(self, "model"))
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _: None)
+    worker.shutdown()
+    assert reference() is None
 
 
 def test_paired_equivalent_cu_policy_reuses_stream_and_graph(monkeypatch):

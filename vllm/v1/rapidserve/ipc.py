@@ -8,7 +8,11 @@ import torch
 from torch.multiprocessing.reductions import StorageWeakRef, shared_cache
 
 from vllm.config import VllmConfig
-from vllm.model_executor.model_loader.utils import initialize_model
+from vllm.model_executor.model_loader.utils import (
+    initialize_model,
+    process_weights_after_loading,
+)
+from vllm.model_executor.utils import weights_already_processed
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 
@@ -118,7 +122,8 @@ def validate_shared_model(config: VllmConfig) -> None:
         or parallel.data_parallel_size != 1
         or parallel.use_ubatching
         or model.is_multimodal_model
-        or model.is_moe
+        or parallel.enable_eplb
+        or parallel.enable_elastic_ep
         or model.is_hybrid
         or model.is_attention_free
         or model.quantization is not None
@@ -141,7 +146,14 @@ def validate_shared_model(config: VllmConfig) -> None:
         or model.is_diffusion
     ):
         raise ValueError(
-            "Shared MRV2 storage requires single-GPU resident dense text models"
+            "Shared MRV2 storage requires single-GPU resident unquantized text models"
+        )
+    if model.is_moe and (
+        model.hf_text_config.model_type != "qwen3_moe"
+        or config.kernel_config.moe_backend not in ("auto", "triton")
+    ):
+        raise ValueError(
+            "Shared MoE execution currently requires Qwen3 MoE with Triton"
         )
 
 
@@ -186,4 +198,8 @@ def import_model(config: VllmConfig, manifest: TensorViews) -> torch.nn.Module:
         )
     if missing:
         raise ValueError(f"IPC model has uninitialized tensors: {missing}")
+    if config.model_config.is_moe:
+        # P exports runtime-format weights; D only rebuilds local kernel state.
+        with weights_already_processed():
+            process_weights_after_loading(model, config.model_config, device)
     return model.eval()
