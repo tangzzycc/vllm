@@ -7,12 +7,16 @@ from dataclasses import replace
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.rapidserve.executor import PairedExecutor
+from vllm.v1.rapidserve.resources import ResourceController
 from vllm.v1.rapidserve.scheduler import DecodeScheduler
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
+
+logger = init_logger(__name__)
 
 
 def configure(config):
@@ -38,6 +42,14 @@ class PairedCoordinator:
         self.policy_epoch = 0
         self.policy_target: float | None = None
         self.policy_dispatched = False
+        self.policy_automatic = False
+        self.policy_quiescing = False
+        config = getattr(core.model_executor, "auto_cu_config", None)
+        self.resource_controller = ResourceController(config) if config else None
+        self.draining = False
+        self.policy_started_at = 0.0
+        self.policy_switch_seconds = 0.0
+        self.next_policy_at = 0.0
         self.core.model_executor.prefill_rpc("start")
 
     @staticmethod
@@ -89,18 +101,89 @@ class PairedCoordinator:
                     else EMPTY_MODEL_RUNNER_OUTPUT
                 )
                 self.merge(outputs, scheduler.complete_decode(batch, model_output))
+                if self.resource_controller is not None and self.policy_target is None:
+                    self.resource_controller.observe_decode(
+                        len(batch.num_scheduled_tokens), time.monotonic()
+                    )
                 progressed = True
+        controller = self.resource_controller
+        if (
+            self.policy_target is not None
+            and time.monotonic() - self.policy_started_at > 30
+        ):
+            raise RuntimeError("Timed out switching paired resource policy")
+        now = time.monotonic()
+        if (
+            controller is not None
+            and self.policy_target is None
+            and not self.draining
+            and now >= self.next_policy_at
+        ):
+            self.next_policy_at = now + 0.05
+            prefill, decode = scheduler.resource_pressure()
+            fraction = controller.select(prefill, decode, now)
+            if fraction != controller.fraction:
+                self._start_resource_policy(fraction, automatic=True)
+                logger.info(
+                    "RapidServe automatic CU policy %.3f -> %.3f: %s",
+                    controller.fraction,
+                    fraction,
+                    controller.reason,
+                )
         # Bound the P queue by the global admission cap owned by D.
-        if self.policy_target is not None and not scheduler.leases and not self.pending:
+        if (
+            self.policy_target is not None
+            and self.policy_automatic
+            and not self.policy_quiescing
+            and executor.can_send()
+        ):
+            executor.quiesce_prefill(self.policy_epoch)
+            self.policy_quiescing = True
+        prefill_ready = (
+            executor.quiesce_ack == self.policy_epoch
+            if self.policy_quiescing
+            else not scheduler.leases
+        )
+        if (
+            self.policy_target is not None
+            and prefill_ready
+            and not self.pending
+            and self.policy_automatic
+            and not self.policy_dispatched
+            and executor.can_send()
+        ):
+            assert controller is not None
+            prefill, decode = scheduler.resource_pressure()
+            if (
+                controller.select(prefill, decode, time.monotonic())
+                != self.policy_target
+            ):
+                self.policy_target = None
+                scheduler.resource_policy_pending = False
+                executor.resume_prefill()
+                self.policy_quiescing = False
+                progressed = True
+        if self.policy_target is not None and prefill_ready and not self.pending:
             if not self.policy_dispatched and executor.can_send():
                 executor.send_policy(self.policy_epoch, self.policy_target)
                 self.policy_dispatched = True
-            elif self.policy_dispatched and executor.policy_ack == self.policy_epoch:
+            elif (
+                self.policy_dispatched
+                and executor.policy_ack == self.policy_epoch
+                and executor.can_send()
+            ):
                 executor.driver_worker.worker.set_resource_policy(
                     self.policy_epoch, self.policy_target
                 )
+                now = time.monotonic()
+                self.policy_switch_seconds += now - self.policy_started_at
+                if controller is not None:
+                    controller.applied(self.policy_target, now)
                 self.policy_target = None
                 self.policy_dispatched = False
+                if self.policy_quiescing:
+                    executor.resume_prefill()
+                    self.policy_quiescing = False
                 scheduler.resource_policy_pending = False
                 progressed = True
         works = (
@@ -111,7 +194,10 @@ class PairedCoordinator:
         if works:
             executor.send_prefills(works)
             progressed = True
-        if self.policy_target is None and len(self.pending) < self.depth:
+        continue_decode = self.policy_target is None or (
+            self.policy_automatic and not self.policy_dispatched and not prefill_ready
+        )
+        if continue_decode and len(self.pending) < self.depth:
             batch = scheduler.schedule()
             self.registered.difference_update(batch.finished_req_ids)
             self.registered.difference_update(batch.preempted_req_ids or set())
@@ -170,28 +256,43 @@ class PairedCoordinator:
                         scheduler.update_from_output(batch, EMPTY_MODEL_RUNNER_OUTPUT),
                     )
                     progressed = True
+        if controller is not None and not scheduler.has_requests() and not self.pending:
+            controller.idle()
         if not progressed and scheduler.has_requests():
             time.sleep(0.0001)
         return outputs, progressed
 
     def request_resource_policy(self, fraction: float):
+        """Apply a manual policy and relinquish automatic resource control."""
+        self._start_resource_policy(fraction)
+        self.resource_controller = None
+
+    def _start_resource_policy(self, fraction: float, automatic: bool = False):
         if self.policy_target is not None:
             raise ValueError("A resource policy change is already pending")
         if fraction and not 0 < fraction < 1:
             raise ValueError("CU fraction must be zero or between zero and one")
         self.policy_epoch += 1
         self.policy_target = fraction
+        self.policy_automatic = automatic
+        self.policy_started_at = time.monotonic()
         self.core.scheduler.resource_policy_pending = True
 
     def drain(self):
         """Wait for submitted GPU work before an in-process pause completes."""
         deadline = time.monotonic() + 30
         outputs: dict[int, EngineCoreOutputs] = {}
-        while (
-            self.core.scheduler.leases or self.pending or self.policy_target is not None
-        ):
-            incoming, _ = self.step()
-            self.merge(outputs, incoming)
-            if time.monotonic() > deadline:
-                raise RuntimeError("Timed out draining paired execution")
+        self.draining = True
+        try:
+            while (
+                self.core.scheduler.leases
+                or self.pending
+                or self.policy_target is not None
+            ):
+                incoming, _ = self.step()
+                self.merge(outputs, incoming)
+                if time.monotonic() > deadline:
+                    raise RuntimeError("Timed out draining paired execution")
+        finally:
+            self.draining = False
         self.merge(self.buffered, outputs)

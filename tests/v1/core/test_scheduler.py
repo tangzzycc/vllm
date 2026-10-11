@@ -7784,3 +7784,168 @@ def test_paired_empty_step_does_not_rotate_pending_runner_buffers(cleanup):
     worker.sample_tokens.assert_not_called()
     assert len(coordinator.pending) == 1
     assert worker.model_runner.finish_requests.call_count == int(cleanup)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"rapidserve_auto_cu": {"prefill_fraction": float("nan")}},
+        {"rapidserve_auto_cu": {"min_decode_batch": 0}},
+        {"rapidserve_auto_cu": {"hold_seconds": -1}},
+        {"rapidserve_auto_cu": {"unknown": 1}},
+        {"rapidserve_auto_cu": "yes"},
+        {"rapidserve_auto_cu": True, "rapidserve_cu_fraction": 0.5},
+    ],
+)
+def test_paired_auto_cu_rejects_invalid_configuration(options):
+    from vllm.v1.rapidserve.resources import ResourcePolicyConfig
+
+    with pytest.raises(ValueError):
+        ResourcePolicyConfig.from_options(options)
+
+
+def test_paired_auto_cu_requires_sustained_overlap_and_retreats_on_slowdown():
+    """A short burst cannot trigger a split; slow decode prevents repeated trials."""
+    from vllm.v1.rapidserve.resources import ResourceController, ResourcePolicyConfig
+
+    controller = ResourceController(ResourcePolicyConfig())
+    for i in range(6):
+        controller.observe_decode(64, i * 0.1)
+    assert controller.select(True, 64, 1) == 0
+    assert controller.select(False, 64, 1.4) == 0
+    assert controller.select(True, 64, 2) == 0
+    assert controller.select(True, 64, 2.6) == 0.5
+    controller.applied(0.5, 2.6)
+    for i in range(6):
+        controller.observe_decode(64, 3 + i * 0.2)
+    assert controller.select(True, 64, 4.1) == 0
+    controller.applied(0, 4.1)
+    assert controller.select(True, 64, 100) == 0
+    controller.idle()
+    for i in range(6):
+        controller.observe_decode(64, 101 + i * 0.1)
+    assert controller.select(True, 64, 102) == 0
+    assert controller.select(True, 64, 103) == 0.5
+
+
+def test_paired_auto_cu_restores_full_resources_and_enforces_itl_target():
+    from vllm.v1.rapidserve.resources import ResourceController, ResourcePolicyConfig
+
+    controller = ResourceController(ResourcePolicyConfig(target_itl_ms=150))
+    controller.applied(0.5, 1)
+    assert controller.select(False, 64, 1.1) == 0
+    assert controller.select(True, 0, 1.1) == 0
+    assert controller.select(True, 32, 1.1) == 0.5
+    assert controller.select(True, 32, 3.1) == 0
+    # A batch-size change must not compare the first gap with another batch.
+    for batch, now in [(32, 3), (64, 4), (64, 4.2), (64, 4.4), (64, 4.6)]:
+        controller.observe_decode(batch, now)
+    assert controller.select(True, 64, 4.6) == 0.5
+    controller.observe_decode(64, 4.8)
+    assert controller.select(True, 64, 4.8) == 0
+
+
+def test_paired_auto_cu_drain_suppresses_new_policy_changes():
+    """Pausing must drain existing writers without starting another CU transition."""
+    from vllm.v1.rapidserve.engine import PairedCoordinator
+
+    coordinator = PairedCoordinator.__new__(PairedCoordinator)
+    coordinator.core = SimpleNamespace(scheduler=SimpleNamespace(leases={"p": None}))
+    coordinator.pending = []
+    coordinator.policy_target = None
+    coordinator.buffered = {}
+    coordinator.draining = False
+
+    def step():
+        assert coordinator.draining
+        coordinator.core.scheduler.leases.clear()
+        return {}, True
+
+    coordinator.step = step
+    coordinator.drain()
+    assert not coordinator.draining
+
+
+def test_paired_auto_cu_pressure_excludes_unadmitted_prefill():
+    """Queued work behind a full admission cap cannot partition pure decode."""
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    scheduler = create_scheduler(scheduler_cls=DecodeScheduler, max_num_seqs=1)
+    first, second = create_requests(2)
+    for request in (first, second):
+        request.sampling_params.temperature = 0
+        scheduler.add_request(request)
+    work = scheduler.grant_prefills()[0]
+    scheduler.complete_prefill(
+        work,
+        ModelRunnerOutput(
+            req_ids=[first.request_id],
+            req_id_to_index={first.request_id: 0},
+            sampled_token_ids=[[1]],
+        ),
+    )
+    assert scheduler.resource_pressure() == (False, 1)
+    scheduler.finish_requests(first.request_id, RequestStatus.FINISHED_ABORTED)
+    assert scheduler.resource_pressure() == (True, 0)
+
+
+@pytest.mark.parametrize("prefill_remaining", [False, True])
+def test_paired_auto_cu_waits_for_gpu_and_owner_ack_before_switch(prefill_remaining):
+    """No role submits work between draining, owner ACK and consumer switching."""
+    from vllm.v1.rapidserve.engine import PairedCoordinator
+    from vllm.v1.rapidserve.executor import PairedExecutor
+    from vllm.v1.rapidserve.resources import ResourcePolicyConfig
+    from vllm.v1.rapidserve.scheduler import DecodeScheduler
+
+    scheduler = create_scheduler(scheduler_cls=DecodeScheduler)
+    scheduler.resource_pressure = lambda: (True, 64)
+    scheduler.grant_prefills = Mock(return_value=[])
+    executor = PairedExecutor.__new__(PairedExecutor)
+    executor.auto_cu_config = ResourcePolicyConfig(enter_seconds=0, hold_seconds=0)
+    executor.prefill_rpc = Mock()
+    executor.check_health = Mock()
+    executor.can_send = lambda: True
+    executor.poll_prefills = lambda: []
+    executor.send_policy = Mock()
+    executor.quiesce_prefill = Mock()
+    executor.resume_prefill = Mock()
+    executor.quiesce_ack = None
+    executor.policy_ack = None
+    worker = Mock()
+    executor.driver_worker = SimpleNamespace(worker=worker)
+    core = SimpleNamespace(
+        scheduler=scheduler,
+        model_executor=executor,
+        vllm_config=SimpleNamespace(max_concurrent_batches=2),
+        _process_aborts_queue=Mock(),
+    )
+    coordinator = PairedCoordinator(core)
+    for i in range(6):
+        coordinator.resource_controller.observe_decode(64, i * 0.1)
+    event = Mock()
+    event.query.return_value = False
+    coordinator.pending.append((Mock(), None, event))
+    coordinator.step()
+    assert coordinator.policy_target == 0.5
+    executor.send_policy.assert_not_called()
+    scheduler.grant_prefills.assert_not_called()
+    coordinator.pending.clear()
+    executor.quiesce_ack = 1
+    scheduler.resource_pressure = lambda: (prefill_remaining, 64)
+    coordinator.step()
+    if not prefill_remaining:
+        executor.send_policy.assert_not_called()
+        executor.resume_prefill.assert_called_once()
+        assert coordinator.policy_target is None
+        assert not scheduler.resource_policy_pending
+        return
+    executor.send_policy.assert_called_once_with(1, 0.5)
+    worker.set_resource_policy.assert_not_called()
+    executor.policy_ack = 1
+    coordinator.step()
+    worker.set_resource_policy.assert_called_once_with(1, 0.5)
+    executor.resume_prefill.assert_called_once()
+    assert coordinator.policy_target is None
+    assert not scheduler.resource_policy_pending
+    coordinator.request_resource_policy(0)
+    assert coordinator.resource_controller is None

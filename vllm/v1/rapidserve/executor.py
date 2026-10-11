@@ -16,6 +16,7 @@ from vllm.utils.system_utils import get_mp_context
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.rapidserve.ipc import validate_shared_model
 from vllm.v1.rapidserve.process import run_prefill
+from vllm.v1.rapidserve.resources import ResourcePolicyConfig
 from vllm.v1.rapidserve.worker import SharedModelWorker
 
 
@@ -41,6 +42,9 @@ class PairedExecutor(UniProcExecutor):
                 os.environ[name] = value
         options = self.vllm_config.additional_config
         assert isinstance(options, dict)
+        self.auto_cu_config = ResourcePolicyConfig.from_options(options)
+        if self.auto_cu_config is not None and not current_platform.is_rocm():
+            raise ValueError("Automatic CU selection requires ROCm")
         fraction = float(options.get("rapidserve_cu_fraction", 0))
         if fraction and (not current_platform.is_rocm() or not 0 < fraction < 1):
             raise ValueError(
@@ -150,6 +154,13 @@ class PairedExecutor(UniProcExecutor):
     def compile_or_warm_up_model(self):
         self.prefill_rpc("compile_or_warm_up_model")
         super().compile_or_warm_up_model()
+        if self.auto_cu_config is not None:
+            worker = self.driver_worker.worker
+            assert isinstance(worker, SharedModelWorker)
+            # Capture both policies before serving, rather than stalling live decode.
+            for fraction in (self.auto_cu_config.prefill_fraction, 0.0):
+                self.prefill_rpc("set_resource_policy", 0, fraction)
+                worker.set_resource_policy(0, fraction)
 
     def send_prefills(self, works):
         assert self.outbound is not None
@@ -182,6 +193,8 @@ class PairedExecutor(UniProcExecutor):
                 raise RuntimeError(f"Prefill process failed:\n{result}")
             if kind == "policy_done":
                 self.policy_ack = result
+            elif kind == "quiesced":
+                self.quiesce_ack = result
             elif kind == "prefill_done":
                 results.append(result)
             else:
@@ -192,6 +205,15 @@ class PairedExecutor(UniProcExecutor):
         assert self.outbound is not None
         self.policy_ack = None
         self.outbound.put_nowait(("policy", (epoch, fraction)))
+
+    def quiesce_prefill(self, epoch):
+        assert self.outbound is not None
+        self.quiesce_ack = None
+        self.outbound.put_nowait(("quiesce", (epoch,)))
+
+    def resume_prefill(self):
+        assert self.outbound is not None
+        self.outbound.put_nowait(("resume", ()))
 
     def check_health(self):
         if self.send_error is not None:

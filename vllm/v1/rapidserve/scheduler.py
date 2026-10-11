@@ -158,6 +158,21 @@ class DecodeScheduler(Scheduler):
         self.reset_preempted_req_ids.update(output.preempted_req_ids or set())
         return works
 
+    def resource_pressure(self) -> tuple[bool, int]:
+        """Return eligible prefill work and the active decode request count."""
+        prefill = False
+        decode = 0
+        for request in self.running:
+            if request.is_finished():
+                continue
+            if request.request_id in self.leases or self.needs_prefill(request):
+                prefill = True
+            else:
+                decode += 1
+        if len(self.running) + len(self.retired) < self.max_num_active_reqs:
+            prefill |= any(not request.is_finished() for request in self.waiting)
+        return prefill, decode
+
     def complete_prefill(
         self, work: PrefillWork | PrefillIdentity, result: ModelRunnerOutput
     ):

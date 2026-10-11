@@ -23,7 +23,15 @@ def run_prefill(config, connection: Connection) -> None:
             assert isinstance(worker, SharedModelWorker)
             connection.send(("weights", worker.export_weights()))
             engine = None
+            quiesce_epoch = None
             while True:
+                if (
+                    quiesce_epoch is not None
+                    and engine is not None
+                    and not engine.pending
+                ):
+                    connection.send(("quiesced", quiesce_epoch))
+                    quiesce_epoch = None
                 if engine is not None and not connection.poll(
                     0 if engine.has_work() else 0.1
                 ):
@@ -47,8 +55,18 @@ def run_prefill(config, connection: Connection) -> None:
                     engine.cancel(args[0])
                     continue
                 if method == "policy":
-                    assert engine is not None and not engine.has_work()
+                    assert engine is not None and not engine.pending
+                    assert engine.paused or not engine.has_work()
                     connection.send(("policy_done", worker.set_resource_policy(*args)))
+                    continue
+                if method == "quiesce":
+                    assert engine is not None
+                    engine.paused = True
+                    quiesce_epoch = args[0]
+                    continue
+                if method == "resume":
+                    assert engine is not None
+                    engine.paused = False
                     continue
                 result = getattr(worker, method)(*args)
                 connection.send(("result", result))

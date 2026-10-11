@@ -27,6 +27,122 @@ from vllm.v1.executor.uniproc_executor import (
 class Mock: ...
 
 
+def test_paired_quiesce_preserves_prefill_work_and_resumes(monkeypatch):
+    """A policy barrier retires GPU work while retaining KV leases and queued work."""
+    from unittest.mock import Mock
+
+    import torch
+
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.rapidserve.prefill import PrefillEngine
+    from vllm.v1.rapidserve.scheduler import PrefillWork
+
+    worker = Mock()
+    worker.model_runner.max_num_tokens = 8
+    worker.model_runner.max_num_reqs = 1
+    worker.model_runner.kv_cache_config.kv_cache_groups = []
+    worker.sample_tokens.return_value = None
+    engine = PrefillEngine(worker, Mock())
+    work = PrefillWork(
+        "session",
+        1,
+        NewRequestData(
+            req_id="r",
+            prompt_token_ids=list(range(16)),
+            mm_features=[],
+            sampling_params=SamplingParams(temperature=0),
+            pooling_params=None,
+            block_ids=(),
+            num_computed_tokens=0,
+            lora_request=None,
+        ),
+        16,
+    )
+    engine.waiting.append((work, 8))
+    engine.resident.add(1)
+    engine.paused = True
+    assert not engine.step()
+    assert engine.has_work()
+    assert engine.resident == {1}
+    worker.execute_model.assert_not_called()
+    engine.paused = False
+    monkeypatch.setattr(torch.cuda, "Event", Mock())
+    assert engine.step()
+    assert worker.execute_model.call_args.args[0].num_scheduled_tokens == {"r": 8}
+
+
+def test_paired_auto_cu_prewarms_partition_before_serving(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+
+    from vllm.v1.rapidserve.executor import PairedExecutor
+    from vllm.v1.rapidserve.resources import ResourcePolicyConfig
+    from vllm.v1.rapidserve.worker import SharedModelWorker
+
+    executor = PairedExecutor.__new__(PairedExecutor)
+    executor.auto_cu_config = ResourcePolicyConfig(prefill_fraction=0.4)
+    executor.prefill_rpc = Mock()
+    worker = SharedModelWorker.__new__(SharedModelWorker)
+    set_policy = Mock()
+    monkeypatch.setattr(worker, "set_resource_policy", set_policy)
+    executor.driver_worker = SimpleNamespace(worker=worker)
+    with patch.object(UniProcExecutor, "compile_or_warm_up_model"):
+        executor.compile_or_warm_up_model()
+    assert [call.args for call in set_policy.call_args_list] == [
+        (0, 0.4),
+        (0, 0.0),
+    ]
+
+
+def test_paired_prefill_policy_barrier_waits_for_gpu_then_resumes(monkeypatch):
+    """The owner ACK follows GPU retirement, while queued work survives the switch."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm.v1.rapidserve import process
+    from vllm.v1.rapidserve.worker import SharedModelWorker
+
+    worker = SharedModelWorker.__new__(SharedModelWorker)
+    monkeypatch.setattr(worker, "export_weights", lambda: "weights")
+    set_policy = Mock(return_value=1)
+    monkeypatch.setattr(worker, "set_resource_policy", set_policy)
+    executor = Mock()
+    executor.driver_worker.worker = worker
+    engine = SimpleNamespace(pending=[1], paused=False, has_work=lambda: True)
+    connection = Mock()
+    # Skip receiving once to retire the simulated GPU batch.
+    connection.poll.side_effect = [True, False, True, True, True]
+
+    def step():
+        assert engine.paused
+        engine.pending.clear()
+        return True
+
+    engine.step = step
+
+    def receive():
+        messages = [
+            ("start", ()),
+            ("quiesce", (1,)),
+            ("policy", (1, 0.5)),
+            ("resume", ()),
+            ("close", ()),
+        ]
+        yield from messages
+
+    # Bootstrap does not call poll; the first poll receives quiesce.
+    connection.recv.side_effect = receive()
+    monkeypatch.setattr(process, "UniProcExecutor", lambda _: executor)
+    monkeypatch.setattr(process, "PrefillEngine", lambda *_: engine)
+    monkeypatch.setattr(process, "destroy_model_parallel", lambda: None)
+    monkeypatch.setattr(process, "destroy_distributed_environment", lambda: None)
+    process.run_prefill(Mock(), connection)
+    kinds = [call.args[0][0] for call in connection.send.call_args_list]
+    assert kinds == ["weights", "result", "quiesced", "policy_done"]
+    assert not engine.paused
+    set_policy.assert_called_once_with(1, 0.5)
+
+
 def test_supports_async_scheduling_base_executor():
     assert Executor.supports_async_scheduling() is False
 

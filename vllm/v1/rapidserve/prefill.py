@@ -24,6 +24,7 @@ class PrefillEngine:
         self.session: str | None = None
         self.cancelled: set[int] = set()
         self.resident: set[int] = set()
+        self.paused = False
 
     def add(self, works):
         for work in works:
@@ -85,7 +86,7 @@ class PrefillEngine:
                     sampled_token_ids=[result.sampled_token_ids[index]],
                 )
                 self.finish(work, sub)
-        if not self.waiting or len(self.pending) >= 2:
+        if self.paused or not self.waiting or len(self.pending) >= 2:
             return progressed
         batch = SchedulerOutput.make_empty()
         batch.num_common_prefix_blocks = [0] * len(
