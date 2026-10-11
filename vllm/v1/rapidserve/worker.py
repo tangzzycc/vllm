@@ -92,6 +92,40 @@ class SharedModelWorker(Worker):
         self.resource_epoch = epoch
         return epoch
 
+    def advance_resource_policy(self, epoch: int, fraction: float):
+        """Order subsequent batches on a prewarmed policy without a host wait."""
+        if epoch < self.resource_epoch:
+            raise ValueError("Stale resource policy epoch")
+        runner = cast(GPUModelRunner, self.model_runner)
+        key: tuple[int, ...] = ()
+        if fraction:
+            total = torch.cuda.get_device_properties(self.device).multi_processor_count
+            masks = partition_cus(total, fraction)
+            options = self.vllm_config.additional_config
+            assert isinstance(options, dict)
+            key = tuple(masks[int(options["rapidserve_role"] == "decode")])
+        owner = self.streams.get(key)
+        if fraction and owner is None:
+            raise ValueError("Resource policy stream was not prewarmed")
+        manager = runner.cudagraph_manager
+        if manager is not None and manager.cudagraph_mode:
+            manager = self.graphs.get(key)
+            if manager is None:
+                raise ValueError("Resource policy graphs were not prewarmed")
+        stream = owner.stream if owner is not None else self.default_stream
+        if key != self.resource_key:
+            previous = torch.cuda.Event()
+            previous.record(runner.main_stream)
+            stream.wait_event(previous)
+            torch.cuda.set_stream(stream)
+            runner.main_stream = stream
+            runner.cudagraph_manager = manager
+            self.stream_owner = owner
+        self.cu_fraction = fraction
+        self.resource_key = key
+        self.resource_epoch = epoch
+        return epoch
+
     @torch.inference_mode()
     def compile_or_warm_up_model(self):
         runner = cast(GPUModelRunner, self.model_runner)

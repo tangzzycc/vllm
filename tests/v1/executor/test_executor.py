@@ -27,6 +27,112 @@ from vllm.v1.executor.uniproc_executor import (
 class Mock: ...
 
 
+@pytest.mark.parametrize(
+    "chunked, expected", [(True, {"a": 6, "b": 2}), (False, {"a": 6})]
+)
+def test_paired_prefill_preserves_whole_prompts_when_chunking_is_disabled(
+    monkeypatch, chunked, expected
+):
+    """A prompt that cannot fit beside the first batch waits intact for the next."""
+    from unittest.mock import Mock
+
+    import torch
+
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.rapidserve.prefill import PrefillEngine
+    from vllm.v1.rapidserve.scheduler import PrefillWork
+
+    worker = Mock()
+    worker.model_runner.scheduler_config.enable_chunked_prefill = chunked
+    worker.model_runner.max_num_tokens = 8
+    worker.model_runner.max_num_reqs = 2
+    worker.model_runner.kv_cache_config.kv_cache_groups = []
+    worker.sample_tokens.return_value = None
+    monkeypatch.setattr(torch.cuda, "Event", Mock)
+    engine = PrefillEngine(worker, Mock())
+    for sequence, req_id in enumerate(("a", "b"), 1):
+        request = NewRequestData(
+            req_id, [1] * 6, [], SamplingParams(temperature=0), None, (), 0, None
+        )
+        engine.add([PrefillWork("session", sequence, request, 6)])
+    assert engine.step()
+    assert worker.execute_model.call_args.args[0].num_scheduled_tokens == expected
+    if not chunked:
+        engine.pending[0][2].query.return_value = False
+        assert engine.step()
+        assert worker.execute_model.call_args.args[0].num_scheduled_tokens == {"b": 6}
+        assert len(engine.pending) == 2
+
+
+def test_paired_prefill_capacity_is_independent_of_decode():
+    """Whole-prompt P buffers grow without expanding D graph or token capacity."""
+    from copy import deepcopy
+
+    from tests.v1.core.utils import create_scheduler
+    from vllm.v1.rapidserve.prefill import configure_prefill
+
+    decode = create_scheduler(max_num_batched_tokens=512).vllm_config
+    decode.additional_config = {"rapidserve_chunked_prefill": False}
+    prefill = deepcopy(decode)
+    configure_prefill(prefill)
+    assert prefill.scheduler_config.max_num_batched_tokens >= (
+        prefill.model_config.max_model_len
+    )
+    assert not prefill.scheduler_config.enable_chunked_prefill
+    assert decode.scheduler_config.max_num_batched_tokens == 512
+    assert isinstance(prefill.additional_config, dict)
+    prefill.additional_config["rapidserve_prefill_max_num_batched_tokens"] = 512
+    with pytest.raises(ValueError, match="smaller than max_model_len"):
+        configure_prefill(prefill)
+
+
+def test_paired_prewarmed_policy_orders_gpu_work_without_device_sync(monkeypatch):
+    """New policy work depends on the previous stream without waiting on the CPU."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import torch
+
+    from vllm.v1.rapidserve.resources import partition_cus
+    from vllm.v1.rapidserve.worker import SharedModelWorker
+
+    worker = SharedModelWorker.__new__(SharedModelWorker)
+    worker.device = torch.device("cuda:0")
+    worker.vllm_config = SimpleNamespace(
+        additional_config={"rapidserve_role": "decode"}
+    )
+    previous, selected = Mock(), Mock()
+    original_graphs, selected_graphs = Mock(), Mock()
+    runner = SimpleNamespace(main_stream=previous, cudagraph_manager=original_graphs)
+    worker.model_runner = runner
+    worker.resource_key = ()
+    worker.default_stream = previous
+    key = tuple(partition_cus(16, 0.5)[1])
+    worker.streams = {key: SimpleNamespace(stream=selected)}
+    worker.graphs = {(): original_graphs, key: selected_graphs}
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=16),
+    )
+    event = Mock()
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    monkeypatch.setattr(torch.cuda, "set_stream", Mock())
+    synchronize = Mock()
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    assert worker.advance_resource_policy(1, 0.5) == 1
+    event.record.assert_called_once_with(previous)
+    selected.wait_event.assert_called_once_with(event)
+    synchronize.assert_not_called()
+    assert runner.cudagraph_manager is selected_graphs
+    assert runner.main_stream is selected
+    worker.graphs.pop(())
+    with pytest.raises(ValueError, match="not prewarmed"):
+        worker.advance_resource_policy(2, 0)
+    assert worker.resource_epoch == 1
+    assert runner.main_stream is selected
+
+
 def test_paired_quiesce_preserves_prefill_work_and_resumes(monkeypatch):
     """A policy barrier retires GPU work while retaining KV leases and queued work."""
     from unittest.mock import Mock
@@ -442,6 +548,7 @@ def test_paired_prefill_waits_for_resident_slot_after_cancel(monkeypatch):
     from vllm.v1.rapidserve.scheduler import PrefillWork
 
     runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(enable_chunked_prefill=True),
         max_num_reqs=1,
         max_num_tokens=8,
         kv_cache_config=SimpleNamespace(kv_cache_groups=[None]),

@@ -8,7 +8,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ResourcePolicyConfig:
-    """Controls a full-CU/partition trial using observed decode completion gaps."""
+    """Controls a full-CU/partition trial using observed decode step times."""
 
     prefill_fraction: float = 0.5
     min_decode_batch: int = 64
@@ -65,8 +65,6 @@ class ResourceController:
         self.changed_at = float("-inf")
         self.retry_at = float("-inf")
         self.overlap_since: float | None = None
-        self.last_decode_at: float | None = None
-        self.last_bucket: int | None = None
         self.full_gaps: dict[int, tuple[float, int]] = {}
         self.split_gaps: dict[int, tuple[float, int]] = {}
         self.rejected: set[int] = set()
@@ -74,15 +72,11 @@ class ResourceController:
         self.reject_bucket: int | None = None
         self.stats = {"switches": 0, "fallbacks": 0, "decode_samples": 0}
 
-    def observe_decode(self, batch_size: int, now: float):
-        bucket = batch_size.bit_length()
-        previous, self.last_decode_at = self.last_decode_at, now
-        last_bucket, self.last_bucket = self.last_bucket, bucket
-        if previous is None or last_bucket != bucket:
-            return
-        gap = now - previous
+    def observe_step(self, batch_size: int, gap: float):
+        """Observe one completed GPU step under the current resource policy."""
         if gap <= 0:
             return
+        bucket = batch_size.bit_length()
         table = self.split_gaps if self.fraction else self.full_gaps
         average, count = table.get(bucket, (gap, 0))
         table[bucket] = (average * 0.75 + gap * 0.25, count + 1)
@@ -134,15 +128,11 @@ class ResourceController:
         self.reject_bucket = None
         self.fraction = fraction
         self.changed_at = now
-        self.last_decode_at = None
-        self.last_bucket = None
         self.split_gaps.clear()
         self.stats["switches"] += 1
 
     def idle(self):
         self.overlap_since = None
-        self.last_decode_at = None
-        self.last_bucket = None
         self.full_gaps.clear()
         self.rejected.clear()
         self.reject_bucket = None

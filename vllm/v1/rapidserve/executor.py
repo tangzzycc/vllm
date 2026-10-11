@@ -15,6 +15,7 @@ from vllm.platforms import current_platform
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.rapidserve.ipc import validate_shared_model
+from vllm.v1.rapidserve.prefill import configure_prefill
 from vllm.v1.rapidserve.process import run_prefill
 from vllm.v1.rapidserve.resources import ResourcePolicyConfig
 from vllm.v1.rapidserve.worker import SharedModelWorker
@@ -58,6 +59,7 @@ class PairedExecutor(UniProcExecutor):
         if context.get_start_method() != "spawn":
             raise ValueError("Paired model execution requires spawn")
         config = deepcopy(self.vllm_config)
+        configure_prefill(config)
         config.compilation_config.static_forward_context = {}
         config.model_config.enforce_eager = True
         config.scheduler_config.async_scheduling = False
@@ -205,6 +207,11 @@ class PairedExecutor(UniProcExecutor):
         assert self.outbound is not None
         self.policy_ack = None
         self.outbound.put_nowait(("policy", (epoch, fraction)))
+
+    def advance_prefill_policy(self, epoch, fraction):
+        assert self.outbound is not None
+        self.policy_ack = None
+        self.outbound.put_nowait(("advance_policy", (epoch, fraction)))
 
     def quiesce_prefill(self, epoch):
         assert self.outbound is not None

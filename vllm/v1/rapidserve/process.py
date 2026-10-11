@@ -59,6 +59,11 @@ def run_prefill(config, connection: Connection) -> None:
                     assert engine.paused or not engine.has_work()
                     connection.send(("policy_done", worker.set_resource_policy(*args)))
                     continue
+                if method == "advance_policy":
+                    connection.send(
+                        ("policy_done", worker.advance_resource_policy(*args))
+                    )
+                    continue
                 if method == "quiesce":
                     assert engine is not None
                     engine.paused = True

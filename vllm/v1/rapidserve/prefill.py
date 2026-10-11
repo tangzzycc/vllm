@@ -12,6 +12,25 @@ from vllm.v1.rapidserve.scheduler import PrefillWork
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
 
 
+def configure_prefill(config):
+    """Size the P runner independently of decode's token budget."""
+    options = config.additional_config
+    chunked = options.get("rapidserve_chunked_prefill", True)
+    if type(chunked) is not bool:
+        raise ValueError("rapidserve_chunked_prefill must be a boolean")
+    scheduler = config.scheduler_config
+    default_budget = scheduler.max_num_batched_tokens
+    if not chunked:
+        default_budget = max(default_budget, config.model_config.max_model_len)
+    budget = options.get("rapidserve_prefill_max_num_batched_tokens", default_budget)
+    if type(budget) is not int or budget < 1:
+        raise ValueError("rapidserve_prefill_max_num_batched_tokens must be positive")
+    scheduler.max_num_batched_tokens = budget
+    scheduler.max_num_scheduled_tokens = budget
+    scheduler.enable_chunked_prefill = chunked
+    scheduler.verify_max_model_len(config.model_config.max_model_len)
+
+
 class PrefillEngine:
     """Batch externally assigned work without owning a KV block manager."""
 
@@ -25,6 +44,7 @@ class PrefillEngine:
         self.cancelled: set[int] = set()
         self.resident: set[int] = set()
         self.paused = False
+        self.chunked = worker.model_runner.scheduler_config.enable_chunked_prefill
 
     def add(self, works):
         for work in works:
@@ -110,7 +130,11 @@ class PrefillEngine:
             ):
                 self.waiting.appendleft((work, computed))
                 break
-            count = min(budget, work.num_tokens - computed)
+            remaining = work.num_tokens - computed
+            if not self.chunked and remaining > budget:
+                self.waiting.appendleft((work, computed))
+                break
+            count = min(budget, remaining)
             data = replace(
                 work.request,
                 num_computed_tokens=work.request.num_computed_tokens + computed,

@@ -7738,6 +7738,7 @@ def test_paired_resource_policy_keeps_an_idle_engine_stepping():
     coordinator = PairedCoordinator.__new__(PairedCoordinator)
     coordinator.core = core
     coordinator.policy_target = None
+    coordinator.auto_policy_epoch = None
     coordinator.policy_epoch = 0
     coordinator.request_resource_policy(0.5)
     assert core.scheduler.resource_policy_pending
@@ -7809,21 +7810,21 @@ def test_paired_auto_cu_requires_sustained_overlap_and_retreats_on_slowdown():
     from vllm.v1.rapidserve.resources import ResourceController, ResourcePolicyConfig
 
     controller = ResourceController(ResourcePolicyConfig())
-    for i in range(6):
-        controller.observe_decode(64, i * 0.1)
+    for _ in range(4):
+        controller.observe_step(64, 0.1)
     assert controller.select(True, 64, 1) == 0
     assert controller.select(False, 64, 1.4) == 0
     assert controller.select(True, 64, 2) == 0
     assert controller.select(True, 64, 2.6) == 0.5
     controller.applied(0.5, 2.6)
-    for i in range(6):
-        controller.observe_decode(64, 3 + i * 0.2)
+    for _ in range(4):
+        controller.observe_step(64, 0.2)
     assert controller.select(True, 64, 4.1) == 0
     controller.applied(0, 4.1)
     assert controller.select(True, 64, 100) == 0
     controller.idle()
-    for i in range(6):
-        controller.observe_decode(64, 101 + i * 0.1)
+    for _ in range(4):
+        controller.observe_step(64, 0.1)
     assert controller.select(True, 64, 102) == 0
     assert controller.select(True, 64, 103) == 0.5
 
@@ -7837,11 +7838,11 @@ def test_paired_auto_cu_restores_full_resources_and_enforces_itl_target():
     assert controller.select(True, 0, 1.1) == 0
     assert controller.select(True, 32, 1.1) == 0.5
     assert controller.select(True, 32, 3.1) == 0
-    # A batch-size change must not compare the first gap with another batch.
-    for batch, now in [(32, 3), (64, 4), (64, 4.2), (64, 4.4), (64, 4.6)]:
-        controller.observe_decode(batch, now)
+    # A smaller batch's samples cannot trigger fallback for a larger one.
+    for batch in [32, 32, 32, 32, 64, 64, 64]:
+        controller.observe_step(batch, 0.2)
     assert controller.select(True, 64, 4.6) == 0.5
-    controller.observe_decode(64, 4.8)
+    controller.observe_step(64, 0.2)
     assert controller.select(True, 64, 4.8) == 0
 
 
@@ -7853,6 +7854,7 @@ def test_paired_auto_cu_drain_suppresses_new_policy_changes():
     coordinator.core = SimpleNamespace(scheduler=SimpleNamespace(leases={"p": None}))
     coordinator.pending = []
     coordinator.policy_target = None
+    coordinator.auto_policy_epoch = None
     coordinator.buffered = {}
     coordinator.draining = False
 
@@ -7889,15 +7891,26 @@ def test_paired_auto_cu_pressure_excludes_unadmitted_prefill():
     assert scheduler.resource_pressure() == (True, 0)
 
 
-@pytest.mark.parametrize("prefill_remaining", [False, True])
-def test_paired_auto_cu_waits_for_gpu_and_owner_ack_before_switch(prefill_remaining):
-    """No role submits work between draining, owner ACK and consumer switching."""
+def test_paired_auto_cu_keeps_decode_running_while_prefill_applies_policy(monkeypatch):
+    """An in-flight GPU step and delayed P ACK cannot stall subsequent decode."""
     from vllm.v1.rapidserve.engine import PairedCoordinator
     from vllm.v1.rapidserve.executor import PairedExecutor
     from vllm.v1.rapidserve.resources import ResourcePolicyConfig
     from vllm.v1.rapidserve.scheduler import DecodeScheduler
 
     scheduler = create_scheduler(scheduler_cls=DecodeScheduler)
+    request = create_requests(1)[0]
+    request.sampling_params.temperature = 0
+    scheduler.add_request(request)
+    work = scheduler.grant_prefills()[0]
+    scheduler.complete_prefill(
+        work,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[1]],
+        ),
+    )
     scheduler.resource_pressure = lambda: (True, 64)
     scheduler.grant_prefills = Mock(return_value=[])
     executor = PairedExecutor.__new__(PairedExecutor)
@@ -7906,12 +7919,11 @@ def test_paired_auto_cu_waits_for_gpu_and_owner_ack_before_switch(prefill_remain
     executor.check_health = Mock()
     executor.can_send = lambda: True
     executor.poll_prefills = lambda: []
-    executor.send_policy = Mock()
-    executor.quiesce_prefill = Mock()
-    executor.resume_prefill = Mock()
-    executor.quiesce_ack = None
+    executor.advance_prefill_policy = Mock()
     executor.policy_ack = None
     worker = Mock()
+    worker.sample_tokens.return_value = None
+    monkeypatch.setattr(torch.cuda, "Event", Mock)
     executor.driver_worker = SimpleNamespace(worker=worker)
     core = SimpleNamespace(
         scheduler=scheduler,
@@ -7920,32 +7932,25 @@ def test_paired_auto_cu_waits_for_gpu_and_owner_ack_before_switch(prefill_remain
         _process_aborts_queue=Mock(),
     )
     coordinator = PairedCoordinator(core)
-    for i in range(6):
-        coordinator.resource_controller.observe_decode(64, i * 0.1)
+    for _ in range(4):
+        coordinator.resource_controller.observe_step(64, 0.1)
     event = Mock()
     event.query.return_value = False
     coordinator.pending.append((Mock(), None, event))
     coordinator.step()
-    assert coordinator.policy_target == 0.5
-    executor.send_policy.assert_not_called()
-    scheduler.grant_prefills.assert_not_called()
-    coordinator.pending.clear()
-    executor.quiesce_ack = 1
-    scheduler.resource_pressure = lambda: (prefill_remaining, 64)
+    assert coordinator.policy_target is None
+    assert coordinator.auto_policy_epoch == 1
+    executor.advance_prefill_policy.assert_called_once_with(1, 0.5)
+    worker.advance_resource_policy.assert_called_once_with(1, 0.5)
+    worker.execute_model.assert_called_once()
+    assert len(coordinator.pending) == 2
+    scheduler.grant_prefills.assert_called_once()
     coordinator.step()
-    if not prefill_remaining:
-        executor.send_policy.assert_not_called()
-        executor.resume_prefill.assert_called_once()
-        assert coordinator.policy_target is None
-        assert not scheduler.resource_policy_pending
-        return
-    executor.send_policy.assert_called_once_with(1, 0.5)
+    assert coordinator.auto_policy_epoch == 1
     worker.set_resource_policy.assert_not_called()
     executor.policy_ack = 1
     coordinator.step()
-    worker.set_resource_policy.assert_called_once_with(1, 0.5)
-    executor.resume_prefill.assert_called_once()
-    assert coordinator.policy_target is None
+    assert coordinator.auto_policy_epoch is None
     assert not scheduler.resource_policy_pending
     coordinator.request_resource_policy(0)
     assert coordinator.resource_controller is None
