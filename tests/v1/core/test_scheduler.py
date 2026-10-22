@@ -7891,7 +7891,10 @@ def test_paired_auto_cu_pressure_excludes_unadmitted_prefill():
     assert scheduler.resource_pressure() == (True, 0)
 
 
-def test_paired_auto_cu_keeps_decode_running_while_prefill_applies_policy(monkeypatch):
+@pytest.mark.parametrize("constrained", [False, True])
+def test_paired_auto_cu_keeps_decode_running_while_prefill_applies_policy(
+    monkeypatch, constrained
+):
     """An in-flight GPU step and delayed P ACK cannot stall subsequent decode."""
     from vllm.v1.rapidserve.engine import PairedCoordinator
     from vllm.v1.rapidserve.executor import PairedExecutor
@@ -7914,7 +7917,10 @@ def test_paired_auto_cu_keeps_decode_running_while_prefill_applies_policy(monkey
     scheduler.resource_pressure = lambda: (True, 64)
     scheduler.grant_prefills = Mock(return_value=[])
     executor = PairedExecutor.__new__(PairedExecutor)
-    executor.auto_cu_config = ResourcePolicyConfig(enter_seconds=0, hold_seconds=0)
+    executor.auto_cu_config = (
+        None if constrained else ResourcePolicyConfig(enter_seconds=0, hold_seconds=0)
+    )
+    executor.constrained = constrained
     executor.prefill_rpc = Mock()
     executor.check_health = Mock()
     executor.can_send = lambda: True
@@ -7932,8 +7938,9 @@ def test_paired_auto_cu_keeps_decode_running_while_prefill_applies_policy(monkey
         _process_aborts_queue=Mock(),
     )
     coordinator = PairedCoordinator(core)
-    for _ in range(4):
-        coordinator.resource_controller.observe_step(64, 0.1)
+    if not constrained:
+        for _ in range(4):
+            coordinator.resource_controller.observe_step(64, 0.1)
     event = Mock()
     event.query.return_value = False
     coordinator.pending.append((Mock(), None, event))

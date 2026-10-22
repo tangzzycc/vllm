@@ -6,10 +6,14 @@ from typing import Any, cast
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import set_current_vllm_config
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.rapidserve.ipc import TensorViews, export_model, import_model
 from vllm.v1.rapidserve.resources import partition_cus
 from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
@@ -23,11 +27,47 @@ class SharedModelWorker(Worker):
     _kv_export: TensorViews | None = None
     resource_epoch: int = 0
 
+    def execute_paired_batch(self, batch, timed=False):
+        """Return through WorkerProc's copy thread after local KV writes finish."""
+        start = torch.cuda.Event(enable_timing=True) if timed else None
+        if start is not None:
+            start.record()
+        self.execute_model(batch)
+        output = self.sample_tokens(None)
+        event = torch.cuda.Event(enable_timing=timed)
+        event.record()
+        return RankOutput(output, start, event)
+
+    def finish_paired_requests(self, batch):
+        cast(GPUModelRunner, self.model_runner).finish_requests(batch)
+
+    def import_rank_kv(self, configs, manifests):
+        if len(configs) != self.parallel_config.world_size or len(manifests) != len(
+            configs
+        ):
+            raise ValueError("KV IPC manifests must cover every TP rank")
+        self.import_kv(configs[self.rank], manifests[self.rank])
+
     def init_device(self):
+        options = self.vllm_config.additional_config
+        assert isinstance(options, dict)
+        weights = options.get("rapidserve_weights")
+        if isinstance(weights, list):
+            if len(weights) != self.parallel_config.world_size:
+                raise ValueError("Weight IPC manifests must cover every TP rank")
+            manifest = weights[self.rank]
+            total = current_platform.get_device_total_memory(self.local_rank)
+            shared = sum(storage[2] for storage in manifest.storages)
+            self.cache_config.gpu_memory_utilization = min(
+                self.cache_config.gpu_memory_utilization,
+                0.5 * (total - shared) / total,
+            )
         super().init_device()
         self.stream_owner = None
         self.default_stream = torch.cuda.Stream(device=self.device)
         self.default_stream.wait_stream(torch.cuda.current_stream(self.device))
+        # HIP CU-masked streams are blocking and cannot be used by PyTorch capture.
+        # Graph replay uses the selected role stream below.
         self.capture_stream = torch.cuda.Stream(device=self.device)
         self.graphs: dict[tuple[int, ...], ModelCudaGraphManager] = {}
         self.streams: dict[tuple[int, ...], Any] = {}
@@ -161,12 +201,14 @@ class SharedModelWorker(Worker):
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         options = self.vllm_config.additional_config
         assert isinstance(options, dict)
-        manifest = (
-            options.get("rapidserve_weights") if isinstance(options, dict) else None
-        )
+        manifest = options.pop("rapidserve_weights", None)
         if manifest is None:
             super().load_model(load_dummy_weights=load_dummy_weights)
             return
+        if isinstance(manifest, list):
+            if len(manifest) != self.parallel_config.world_size:
+                raise ValueError("Weight IPC manifests must cover every TP rank")
+            manifest = manifest[self.rank]
         with set_current_vllm_config(self.vllm_config):
             runner = cast(GPUModelRunner, self.model_runner)
             with runner.jit_warmup_registry.activate():
@@ -176,10 +218,12 @@ class SharedModelWorker(Worker):
         set_torch_threads_for_runtime()
 
     def export_weights(self) -> TensorViews:
+        torch.accelerator.synchronize()
         self._weight_export = export_model(self.model_runner.model)
         return self._weight_export
 
     def export_kv(self) -> TensorViews:
+        torch.accelerator.synchronize()
         layers = self.vllm_config.compilation_config.static_forward_context
         self._kv_export = TensorViews.export(
             {
@@ -195,14 +239,60 @@ class SharedModelWorker(Worker):
         if config.kv_cache_layout is not None:
             record_kv_cache_layout(self.cache_config, config.kv_cache_layout)
         self.cache_config.num_gpu_blocks = config.num_blocks
+        self.cache_config.hash_block_size = config.hash_block_size
+        self.cache_config.cache_hit_alignment_tokens = config.cache_hit_alignment_tokens
         cast(GPUModelRunner, self.model_runner).initialize_kv_cache(
             config, shared_kv_caches=manifest.import_tensors(self.device)
         )
 
     def shutdown(self) -> None:
+        runner = getattr(self, "model_runner", None)
+        model = getattr(runner, "model", None)
+        tensors: list[torch.Tensor | None] = []
+        if model is not None:
+            for module in model.modules():
+                tensors.extend(module._parameters.values())
+                tensors.extend(module._buffers.values())
+                tensors.extend(
+                    value
+                    for value in vars(module).values()
+                    if isinstance(value, torch.Tensor)
+                )
         super().shutdown()
+        # Compiled functions can retain Tensor objects after their module is freed.
+        # Detach their storage after GPU completion and before the IPC owner exits.
+        for tensor in tensors:
+            if tensor is not None:
+                tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
+        tensors.clear()
         if hasattr(self, "graphs"):
             self.graphs.clear()
+        wrappers = list(CUDAGraphWrapper._all_instances) + list(
+            BreakableCUDAGraphWrapper._all_instances
+        )
+        for wrapper in wrappers:
+            if wrapper.vllm_config is self.vllm_config:
+                wrapper.clear_graphs()
+        if model is not None:
+            from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+            # Compiled callables can retain modules beyond the runner's lifetime.
+            for module in model.modules():
+                if isinstance(module, TorchCompileWithNoGuardsWrapper):
+                    module.cleanup()
+                    if hasattr(module, "aot_compiled_fn"):
+                        module.aot_compiled_fn = None
+                    module._compiled_callable = None
+                if isinstance(module, MoERunner) and hasattr(
+                    module.router, "e_score_correction_bias"
+                ):
+                    module.router.e_score_correction_bias = None
+                module._parameters.clear()
+                module._buffers.clear()
+                for name, value in list(vars(module).items()):
+                    if isinstance(value, torch.Tensor):
+                        delattr(module, name)
+            del module, model
         if not hasattr(self, "default_stream"):
             return
         torch.cuda.set_stream(self.default_stream)
@@ -213,3 +303,19 @@ class SharedModelWorker(Worker):
         self._weight_export = None
         self._kv_export = None
         gc.collect()
+        torch.accelerator.empty_cache()
+
+
+class RankOutput(AsyncModelRunnerOutput):
+    def __init__(self, output, start, event):
+        self.output = output
+        self.start = start
+        self.event = event
+
+    def get_output(self):
+        self.event.synchronize()
+        output = self.output.get_output() if self.output is not None else None
+        duration = (
+            self.start.elapsed_time(self.event) if self.start is not None else 0.0
+        )
+        return output, duration

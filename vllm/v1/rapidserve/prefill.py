@@ -8,14 +8,14 @@ import torch
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.rapidserve.parallel import submit_batch
 from vllm.v1.rapidserve.scheduler import PrefillWork
-from vllm.v1.worker.gpu.async_utils import AsyncOutput
 
 
 def configure_prefill(config):
     """Size the P runner independently of decode's token budget."""
     options = config.additional_config
-    chunked = options.get("rapidserve_chunked_prefill", True)
+    chunked = options.get("rapidserve_chunked_prefill", False)
     if type(chunked) is not bool:
         raise ValueError("rapidserve_chunked_prefill must be a boolean")
     scheduler = config.scheduler_config
@@ -28,6 +28,10 @@ def configure_prefill(config):
     scheduler.max_num_batched_tokens = budget
     scheduler.max_num_scheduled_tokens = budget
     scheduler.enable_chunked_prefill = chunked
+    max_seqs = options.get("rapidserve_prefill_max_num_seqs", scheduler.max_num_seqs)
+    if type(max_seqs) is not int or max_seqs < 1:
+        raise ValueError("rapidserve_prefill_max_num_seqs must be positive")
+    scheduler.max_num_seqs = max_seqs
     scheduler.verify_max_model_len(config.model_config.max_model_len)
 
 
@@ -76,6 +80,8 @@ class PrefillEngine:
 
     @torch.inference_mode()
     def step(self):
+        if hasattr(self.worker, "check_health"):
+            self.worker.check_health()
         progressed = False
         if self.pending:
             selected, output, event = self.pending[0]
@@ -147,12 +153,7 @@ class PrefillEngine:
             budget -= count
         if not selected:
             return progressed
-        self.worker.execute_model(batch)
-        output = self.worker.sample_tokens(None)
-        if output is not None and not isinstance(output, AsyncOutput):
-            raise RuntimeError("Prefill requires MRV2 asynchronous output")
-        event = torch.cuda.Event()
-        event.record()
+        output, event, _ = submit_batch(self.worker, batch)
         self.pending.append((selected, output, event))
         return True
 

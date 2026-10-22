@@ -259,7 +259,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.math_utils import cdiv, round_down, round_up
@@ -1218,6 +1218,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
+        if is_weights_pre_processed() and (
+            hasattr(self, "W_UK_T") or hasattr(self, "W_K")
+        ):
+            # IPC attached both projection and absorbed weights in runtime format.
+            return
         # Let per-backend impls do their own weight packing first (no-op
         # unless overridden), mirroring Attention.process_weights_after_loading.
         self.impl.process_weights_after_loading(act_dtype)

@@ -27,28 +27,159 @@ from vllm.v1.executor.uniproc_executor import (
 class Mock: ...
 
 
-@pytest.mark.parametrize("backend", ["auto", "triton", "aiter"])
+@pytest.mark.parametrize("backend", ["auto", "triton", "aiter", "marlin"])
 def test_paired_moe_support_requires_a_compatible_backend(monkeypatch, backend):
-    """Qwen3 MoE can share weights; unverified weight layouts remain rejected."""
+    """DeepSeek shares runtime weights; unsupported models/layouts fail closed."""
     from vllm.v1.rapidserve.ipc import validate_shared_model
 
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     config = EngineArgs(
-        model="Qwen/Qwen3-30B-A3B",
+        model="deepseek-ai/DeepSeek-V3",
     ).create_engine_config()
     config.kernel_config.moe_backend = backend
-    if backend == "aiter":
-        with pytest.raises(ValueError, match="Qwen3 MoE with Triton"):
+    if backend == "marlin":
+        with pytest.raises(ValueError, match="Triton or AITER"):
             validate_shared_model(config)
     else:
         validate_shared_model(config)
         config.model_config.hf_text_config.model_type = "other_moe"
-        with pytest.raises(ValueError, match="Qwen3 MoE with Triton"):
+        with pytest.raises(ValueError, match="DeepSeek-V3/R1"):
             validate_shared_model(config)
-        config.model_config.hf_text_config.model_type = "qwen3_moe"
+        config.model_config.hf_text_config.model_type = "deepseek_v3"
         config.parallel_config.enable_eplb = True
-        with pytest.raises(ValueError, match="single-GPU resident"):
+        with pytest.raises(ValueError, match="single-node TP resident"):
             validate_shared_model(config)
+
+
+def test_paired_deepseek_tp_support_rejects_incompatible_parallelism(monkeypatch):
+    from vllm.v1.rapidserve.ipc import validate_shared_model
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    config = EngineArgs(model="deepseek-ai/DeepSeek-V3").create_engine_config()
+    config.parallel_config.tensor_parallel_size = 8
+    config.parallel_config.world_size = 8
+    validate_shared_model(config)
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    assert isinstance(config.quant_config, Fp8Config)
+    config.quant_config.weight_block_size = [64, 128]
+    with pytest.raises(ValueError, match="checkpoint block FP8"):
+        validate_shared_model(config)
+    config.quant_config.weight_block_size = [128, 128]
+    config.parallel_config.enable_expert_parallel = True
+    with pytest.raises(ValueError, match="single-node TP"):
+        validate_shared_model(config)
+
+
+def test_paired_tp_completion_waits_for_all_rank_outputs():
+    """A shared KV lease cannot retire when only the sampling rank has finished."""
+    from vllm.v1.rapidserve.parallel import RemoteOutput
+
+    completion: Future[Any] = Future()
+    output = RemoteOutput(completion)
+    assert not output.copy_event.query()
+    completion.set_result([("rank-zero", 2.0), (None, 5.0)])
+    assert output.copy_event.query()
+    assert output.get_output() == "rank-zero"
+    assert output.copy_event.elapsed_time(output.copy_event) == 5.0
+
+
+def test_paired_tp_rpc_failure_propagates_to_pending_batches():
+    """A failed rank completion also fails later submissions on its response queue."""
+    from types import SimpleNamespace
+
+    from vllm.v1.rapidserve.parallel import ParallelWorker
+
+    first: Future[Any] = Future()
+    second: Future[Any] = Future()
+    first.set_exception(RuntimeError("rank failed"))
+    second.set_result("unexpected success")
+    replies = iter((first, second))
+    executor = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=2)
+        ),
+        is_failed=False,
+        collective_rpc=lambda *args, **kwargs: next(replies),
+    )
+    worker = ParallelWorker(executor)
+    try:
+        completion = worker.rpc("first", non_block=True)
+        with pytest.raises(RuntimeError, match="rank failed"):
+            completion.result(timeout=5)
+        with pytest.raises(RuntimeError, match="Paired TP worker RPC failed"):
+            worker.rpc("second")
+    finally:
+        worker.close()
+
+
+def test_paired_tp_rpc_completion_requires_the_last_rank():
+    """Use the executor's actual response aggregation before exposing shared KV."""
+    from collections import deque
+    from queue import Queue
+    from threading import Event
+    from types import SimpleNamespace
+
+    from vllm.v1.executor.multiproc_executor import WorkerProc
+    from vllm.v1.rapidserve.parallel import ParallelWorker, RemoteOutput
+
+    rank_zero_read = Event()
+
+    class ResponseQueue:
+        def __init__(self, first=False):
+            self.queue: Queue[Any] = Queue()
+            self.first = first
+
+        def dequeue(self, timeout=None):
+            response = self.queue.get(timeout=timeout)
+            if self.first:
+                rank_zero_read.set()
+            return WorkerProc.ResponseStatus.SUCCESS, response
+
+    executor = MultiprocExecutor.__new__(MultiprocExecutor)
+    executor.is_failed = False
+    executor.futures_queue = deque()
+    executor.rpc_broadcast_mq = SimpleNamespace(enqueue=lambda _: None)
+    executor.response_mqs = [ResponseQueue(first=True), ResponseQueue()]
+    executor.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=2)
+    )
+    worker = ParallelWorker(executor)
+    try:
+        output = RemoteOutput(worker.rpc("execute_paired_batch", non_block=True))
+        assert not output.future.cancel()
+        executor.response_mqs[0].queue.put(("sample", 2.0))
+        assert rank_zero_read.wait(timeout=5)
+        assert not output.copy_event.query()
+        executor.response_mqs[1].queue.put((None, 5.0))
+        output.future.result(timeout=5)
+        assert output.copy_event.query()
+        assert output.get_output() == "sample"
+    finally:
+        worker.close()
+
+
+def test_paired_tp_shutdown_closes_consumers_before_the_owner():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from vllm.v1.rapidserve.executor import PairedExecutor
+
+    order = []
+    executor = PairedExecutor.__new__(PairedExecutor)
+    executor.decode_executor = SimpleNamespace(
+        shutdown=lambda: order.append("decode-close")
+    )
+    executor.parallel_worker = SimpleNamespace(
+        close=lambda: order.append("response-reader-close")
+    )
+    executor.connection = Mock()
+    executor.connection.send.side_effect = lambda _: order.append("owner-close")
+    executor.prefill_process = Mock()
+    executor.prefill_process.is_alive.return_value = False
+    executor.shutdown()
+    assert order.index("decode-close") < order.index("owner-close")
+    assert order.index("response-reader-close") < order.index("owner-close")
 
 
 @pytest.mark.parametrize(
@@ -96,13 +227,15 @@ def test_paired_prefill_capacity_is_independent_of_decode():
     from vllm.v1.rapidserve.prefill import configure_prefill
 
     decode = create_scheduler(max_num_batched_tokens=512).vllm_config
-    decode.additional_config = {"rapidserve_chunked_prefill": False}
+    decode.additional_config = {"rapidserve_prefill_max_num_seqs": 4}
     prefill = deepcopy(decode)
     configure_prefill(prefill)
     assert prefill.scheduler_config.max_num_batched_tokens >= (
         prefill.model_config.max_model_len
     )
     assert not prefill.scheduler_config.enable_chunked_prefill
+    assert prefill.scheduler_config.max_num_seqs == 4
+    assert decode.scheduler_config.max_num_seqs != 4
     assert decode.scheduler_config.max_num_batched_tokens == 512
     assert isinstance(prefill.additional_config, dict)
     prefill.additional_config["rapidserve_prefill_max_num_batched_tokens"] = 512
@@ -266,7 +399,8 @@ def test_paired_prefill_policy_barrier_waits_for_gpu_then_resumes(monkeypatch):
     monkeypatch.setattr(process, "PrefillEngine", lambda *_: engine)
     monkeypatch.setattr(process, "destroy_model_parallel", lambda: None)
     monkeypatch.setattr(process, "destroy_distributed_environment", lambda: None)
-    process.run_prefill(Mock(), connection)
+    config = SimpleNamespace(parallel_config=SimpleNamespace(world_size=1))
+    process.run_prefill(config, connection)
     kinds = [call.args[0][0] for call in connection.send.call_args_list]
     assert kinds == ["weights", "result", "quiesced", "policy_done"]
     assert not engine.paused
@@ -502,7 +636,10 @@ def test_paired_late_cancel_does_not_retain_a_completed_identity():
     assert not engine.cancelled
 
 
-def test_paired_owner_error_waits_for_consumer_before_teardown(monkeypatch):
+@pytest.mark.parametrize("shutdown_fails", [False, True])
+def test_paired_owner_error_waits_for_consumer_before_teardown(
+    monkeypatch, shutdown_fails
+):
     """A P bootstrap error retains exported storage until D closes its channel."""
     from unittest.mock import Mock
 
@@ -517,10 +654,18 @@ def test_paired_owner_error_waits_for_consumer_before_teardown(monkeypatch):
     )
     executor = Mock()
     executor.driver_worker.worker = worker
-    executor.shutdown.side_effect = lambda: order.append("owner-shutdown")
+
+    def shutdown():
+        order.append("owner-shutdown")
+        if shutdown_fails:
+            raise RuntimeError("Owner shutdown failed")
+
+    executor.shutdown.side_effect = shutdown
     monkeypatch.setattr(process, "UniProcExecutor", lambda _: executor)
-    monkeypatch.setattr(process, "destroy_model_parallel", lambda: None)
-    monkeypatch.setattr(process, "destroy_distributed_environment", lambda: None)
+    destroy_parallel = Mock()
+    destroy_environment = Mock()
+    monkeypatch.setattr(process, "destroy_model_parallel", destroy_parallel)
+    monkeypatch.setattr(process, "destroy_distributed_environment", destroy_environment)
     connection = Mock()
     connection.poll.return_value = True
 
@@ -532,25 +677,40 @@ def test_paired_owner_error_waits_for_consumer_before_teardown(monkeypatch):
         return "export_kv", ()
 
     connection.recv.side_effect = receive
-    process.run_prefill(Mock(), connection)
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(parallel_config=SimpleNamespace(world_size=1))
+    if shutdown_fails:
+        with pytest.raises(RuntimeError, match="Owner shutdown failed"):
+            process.run_prefill(config, connection)
+    else:
+        process.run_prefill(config, connection)
     assert order == ["export", "consumer-close", "owner-shutdown"]
     error = connection.send.call_args_list[-1].args[0]
     assert error[0] == "error" and "KV export failed" in error[1]
+    destroy_parallel.assert_called_once()
+    destroy_environment.assert_called_once()
+    connection.close.assert_called_once()
 
 
-def test_paired_consumer_shutdown_failure_still_closes_owner(monkeypatch):
+@pytest.mark.parametrize("parallel", [False, True])
+def test_paired_consumer_shutdown_failure_still_closes_owner(monkeypatch, parallel):
     from unittest.mock import Mock
 
     from vllm.v1.rapidserve.executor import PairedExecutor
 
     executor = PairedExecutor.__new__(PairedExecutor)
-    executor.driver_worker = Mock()
+    shutdown = Mock(side_effect=RuntimeError("GPU failed"))
+    reader = Mock()
+    if parallel:
+        executor.decode_executor = Mock(shutdown=shutdown)
+        executor.parallel_worker = reader
+    else:
+        executor.driver_worker = Mock()
+        monkeypatch.setattr(UniProcExecutor, "shutdown", shutdown)
     executor.connection = Mock()
     executor.prefill_process = Mock()
     executor.prefill_process.is_alive.return_value = False
-    monkeypatch.setattr(
-        UniProcExecutor, "shutdown", Mock(side_effect=RuntimeError("GPU failed"))
-    )
     connection, process = executor.connection, executor.prefill_process
     with pytest.raises(RuntimeError, match="GPU failed"):
         executor.shutdown()
@@ -558,6 +718,9 @@ def test_paired_consumer_shutdown_failure_still_closes_owner(monkeypatch):
     process.join.assert_called_once_with(10)
     executor.shutdown()
     connection.send.assert_called_once_with(("close", ()))
+    shutdown.assert_called_once()
+    if parallel:
+        reader.close.assert_called_once()
 
 
 def test_paired_prefill_waits_for_resident_slot_after_cancel(monkeypatch):

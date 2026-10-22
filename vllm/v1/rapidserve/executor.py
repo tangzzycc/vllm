@@ -7,14 +7,17 @@ from copy import deepcopy
 from multiprocessing.connection import wait
 from queue import Queue
 from threading import Thread
+from typing import cast
 from weakref import ref
 
 from vllm.config import set_current_vllm_config
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.utils.system_utils import get_mp_context
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.rapidserve.ipc import validate_shared_model
+from vllm.v1.rapidserve.parallel import ParallelWorker
 from vllm.v1.rapidserve.prefill import configure_prefill
 from vllm.v1.rapidserve.process import run_prefill
 from vllm.v1.rapidserve.resources import ResourcePolicyConfig
@@ -22,7 +25,16 @@ from vllm.v1.rapidserve.worker import SharedModelWorker
 
 
 class PairedExecutor(UniProcExecutor):
-    """Decode's local worker with a separately scheduled prefill process."""
+    """Independent P/D worker groups sharing the same rank-local allocations."""
+
+    decode_executor: MultiprocExecutor | None = None
+    parallel_worker: ParallelWorker | None = None
+
+    @property
+    def paired_worker(self) -> ParallelWorker | SharedModelWorker:
+        if self.parallel_worker is not None:
+            return self.parallel_worker
+        return cast(SharedModelWorker, self.driver_worker.worker)
 
     def _init_executor(self) -> None:
         self.shutting_down = False
@@ -32,8 +44,6 @@ class PairedExecutor(UniProcExecutor):
         self.sender: Thread | None = None
         self.send_error: Exception | None = None
         validate_shared_model(self.vllm_config)
-        if self.vllm_config.model_config.is_moe:
-            self.vllm_config.kernel_config.moe_backend = "triton"
         if current_platform.is_rocm():
             # HIP's parallel graph queues do not inherit the launch stream CU mask.
             for name, value in (
@@ -46,6 +56,15 @@ class PairedExecutor(UniProcExecutor):
         options = self.vllm_config.additional_config
         assert isinstance(options, dict)
         self.auto_cu_config = ResourcePolicyConfig.from_options(options)
+        self.constrained = options.get("rapidserve_constrained", False)
+        if type(self.constrained) is not bool:
+            raise ValueError("rapidserve_constrained must be a boolean")
+        if self.constrained and (
+            self.auto_cu_config is not None
+            or options.get("rapidserve_cu_fraction", 0)
+            or not current_platform.is_rocm()
+        ):
+            raise ValueError("Constrained CU selection requires ROCm and full-CU start")
         if self.auto_cu_config is not None and not current_platform.is_rocm():
             raise ValueError("Automatic CU selection requires ROCm")
         fraction = float(options.get("rapidserve_cu_fraction", 0))
@@ -65,6 +84,10 @@ class PairedExecutor(UniProcExecutor):
         config.compilation_config.static_forward_context = {}
         config.model_config.enforce_eager = True
         config.scheduler_config.async_scheduling = False
+        if config.parallel_config.world_size > 1:
+            # WorkerProc resolves completions in its copy thread; P still batches
+            # via PrefillEngine rather than vLLM's decode scheduler.
+            config.scheduler_config.async_scheduling = True
         config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
         config.compilation_config.mode = CompilationMode.NONE
         config.kernel_config.enable_jit_warmup = False
@@ -98,13 +121,21 @@ class PairedExecutor(UniProcExecutor):
             self.vllm_config.parallel_config.worker_cls = (
                 config.parallel_config.worker_cls
             )
-            total_memory = current_platform.get_device_total_memory()
-            shared_bytes = sum(storage[2] for storage in weights.storages)
-            self.vllm_config.cache_config.gpu_memory_utilization = min(
-                self.vllm_config.cache_config.gpu_memory_utilization,
-                0.5 * (total_memory - shared_bytes) / total_memory,
-            )
-            super()._init_executor()
+            if self.parallel_config.world_size > 1:
+                decode_config = deepcopy(self.vllm_config)
+                # WorkerProc's output thread is independent of scheduler choice.
+                decode_config.scheduler_config.async_scheduling = True
+                self.decode_executor = MultiprocExecutor(decode_config)
+                self.parallel_worker = ParallelWorker(self.decode_executor)
+                self.vllm_config.additional_config.pop("rapidserve_weights", None)
+            else:
+                total_memory = current_platform.get_device_total_memory()
+                shared_bytes = sum(storage[2] for storage in weights.storages)
+                self.vllm_config.cache_config.gpu_memory_utilization = min(
+                    self.vllm_config.cache_config.gpu_memory_utilization,
+                    0.5 * (total_memory - shared_bytes) / total_memory,
+                )
+                super()._init_executor()
         except BaseException:
             self.shutdown()
             raise
@@ -147,25 +178,39 @@ class PairedExecutor(UniProcExecutor):
         return self.outbound is not None and not self.outbound.full()
 
     def determine_available_memory(self):
-        return [self.vllm_config.cache_config.kv_cache_memory_bytes]
+        return [
+            self.vllm_config.cache_config.kv_cache_memory_bytes
+        ] * self.parallel_config.world_size
 
     def initialize_from_config(self, kv_cache_configs):
-        config = kv_cache_configs[0]
+        parallel = self.parallel_worker is not None
+        config = kv_cache_configs if parallel else kv_cache_configs[0]
         self.prefill_rpc("initialize_from_config", config)
         manifest = self.prefill_rpc("export_kv")
-        worker = self.driver_worker.worker
-        assert isinstance(worker, SharedModelWorker)
+        worker = self.paired_worker
         with set_current_vllm_config(self.vllm_config):
             worker.import_kv(config, manifest)
 
     def compile_or_warm_up_model(self):
         self.prefill_rpc("compile_or_warm_up_model")
-        super().compile_or_warm_up_model()
-        if self.auto_cu_config is not None:
-            worker = self.driver_worker.worker
-            assert isinstance(worker, SharedModelWorker)
+        worker = self.paired_worker
+        if isinstance(worker, ParallelWorker):
+            times = worker.compile_or_warm_up_model()
+            self.vllm_config.compilation_config.compilation_time = max(
+                timing.language_model for timing in times
+            )
+            self.vllm_config.compilation_config.encoder_compilation_time = max(
+                timing.encoder for timing in times
+            )
+        else:
+            super().compile_or_warm_up_model()
+        if self.auto_cu_config is not None or getattr(self, "constrained", False):
+            worker = self.paired_worker
             # Capture both policies before serving, rather than stalling live decode.
-            for fraction in (self.auto_cu_config.prefill_fraction, 0.0):
+            candidate = (
+                self.auto_cu_config.prefill_fraction if self.auto_cu_config else 0.5
+            )
+            for fraction in (candidate, 0.0):
                 self.prefill_rpc("set_resource_policy", 0, fraction)
                 worker.set_resource_policy(0, fraction)
 
@@ -179,6 +224,8 @@ class PairedExecutor(UniProcExecutor):
 
     def register_failure_callback(self, callback):
         self.failure_callback = callback
+        if self.decode_executor is not None:
+            self.decode_executor.register_failure_callback(callback)
         reference = ref(self)
         sentinel = self.prefill_process.sentinel
 
@@ -232,8 +279,20 @@ class PairedExecutor(UniProcExecutor):
             raise RuntimeError("Prefill communication failed") from self.send_error
         if self.prefill_process is None or not self.prefill_process.is_alive():
             raise RuntimeError("Prefill process exited")
+        if self.decode_executor is not None and self.decode_executor.is_failed:
+            raise RuntimeError("Decode worker group failed")
+        if self.decode_executor is not None:
+            self.paired_worker.check_health()
 
-    def collective_rpc(self, method, *args, **kwargs):
+    def collective_rpc(
+        self,
+        method,
+        timeout=None,
+        args=(),
+        kwargs=None,
+        non_block=False,
+        single_value=False,
+    ):
         if method in (
             "sleep",
             "wake_up",
@@ -248,12 +307,43 @@ class PairedExecutor(UniProcExecutor):
             raise ValueError(f"Paired execution does not support {method}")
         if method == "synchronize_device" and getattr(self, "outbound", None) is None:
             self.prefill_rpc(method)
-        return super().collective_rpc(method, *args, **kwargs)
+        if self.decode_executor is not None:
+            if single_value and non_block:
+                raise ValueError("Paired TP does not support single-value async RPC")
+            worker = self.paired_worker
+            assert isinstance(worker, ParallelWorker)
+            result = worker.rpc(
+                method,
+                *args,
+                non_block=non_block,
+                timeout=timeout,
+                kwargs=kwargs,
+            )
+            if single_value:
+                return result[0]
+            return result
+        return super().collective_rpc(
+            method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs,
+            non_block=non_block,
+            single_value=single_value,
+        )
 
     def shutdown(self):
         self.shutting_down = True
         try:
-            if getattr(self, "driver_worker", None) is not None:
+            if (decode := self.decode_executor) is not None:
+                self.decode_executor = None
+                worker = self.parallel_worker
+                self.parallel_worker = None
+                try:
+                    decode.shutdown()
+                finally:
+                    if worker is not None:
+                        worker.close()
+            elif getattr(self, "driver_worker", None) is not None:
                 try:
                     super().shutdown()
                 finally:

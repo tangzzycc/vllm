@@ -12,9 +12,9 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.rapidserve.executor import PairedExecutor
+from vllm.v1.rapidserve.parallel import submit_batch
 from vllm.v1.rapidserve.resources import ResourceController
 from vllm.v1.rapidserve.scheduler import DecodeScheduler
-from vllm.v1.worker.gpu.async_utils import AsyncOutput
 
 logger = init_logger(__name__)
 
@@ -45,6 +45,8 @@ class PairedCoordinator:
         self.auto_policy_epoch: int | None = None
         config = getattr(core.model_executor, "auto_cu_config", None)
         self.resource_controller = ResourceController(config) if config else None
+        self.constrained = getattr(core.model_executor, "constrained", False)
+        self.constrained_fraction = 0.0
         self.draining = False
         self.policy_started_at = 0.0
         self.policy_switch_seconds = 0.0
@@ -128,6 +130,25 @@ class PairedCoordinator:
             raise RuntimeError("Timed out switching paired resource policy")
         now = time.monotonic()
         if (
+            self.constrained
+            and self.policy_target is None
+            and self.auto_policy_epoch is None
+            and not self.draining
+            and executor.can_send()
+        ):
+            prefill, decode = scheduler.resource_pressure()
+            fraction = 0.5 if prefill and decode >= 64 else 0.0
+            if fraction != self.constrained_fraction:
+                self.policy_epoch += 1
+                self.auto_policy_epoch = self.policy_epoch
+                scheduler.resource_policy_pending = True
+                self.policy_started_at = now
+                executor.advance_prefill_policy(self.policy_epoch, fraction)
+                executor.paired_worker.advance_resource_policy(
+                    self.policy_epoch, fraction
+                )
+                self.constrained_fraction = fraction
+        if (
             controller is not None
             and self.policy_target is None
             and self.auto_policy_epoch is None
@@ -150,7 +171,7 @@ class PairedCoordinator:
                 scheduler.resource_policy_pending = True
                 self.policy_started_at = now
                 executor.advance_prefill_policy(self.policy_epoch, fraction)
-                executor.driver_worker.worker.advance_resource_policy(
+                executor.paired_worker.advance_resource_policy(
                     self.policy_epoch, fraction
                 )
                 controller.applied(fraction, now)
@@ -163,7 +184,7 @@ class PairedCoordinator:
                 and executor.policy_ack == self.policy_epoch
                 and executor.can_send()
             ):
-                executor.driver_worker.worker.set_resource_policy(
+                executor.paired_worker.set_resource_policy(
                     self.policy_epoch, self.policy_target
                 )
                 now = time.monotonic()
@@ -224,23 +245,16 @@ class PairedCoordinator:
                 scheduler.decode_in_flight.update(batch.num_scheduled_tokens)
             if batch.num_scheduled_tokens:
                 timed = self.resource_controller is not None
+                result, event, start = submit_batch(
+                    executor.paired_worker, batch, timed
+                )
                 if timed:
-                    start = torch.cuda.Event(enable_timing=True)
-                    start.record()
                     self.decode_timings[id(batch)] = (self.policy_epoch, start)
-                executor.driver_worker.worker.execute_model(batch)
-                result = executor.driver_worker.worker.sample_tokens(None)
-                if result is not None and not isinstance(result, AsyncOutput):
-                    raise RuntimeError(
-                        "Paired decode requires MRV2 asynchronous output"
-                    )
-                event = torch.cuda.Event(enable_timing=timed)
-                event.record()
                 self.pending.append((batch, result, event))
                 progressed = True
             else:
                 if batch.finished_req_ids or batch.preempted_req_ids:
-                    executor.driver_worker.worker.model_runner.finish_requests(batch)
+                    executor.paired_worker.model_runner.finish_requests(batch)
                     self.merge(
                         outputs,
                         scheduler.update_from_output(batch, EMPTY_MODEL_RUNNER_OUTPUT),
@@ -256,6 +270,7 @@ class PairedCoordinator:
         """Apply a manual policy and relinquish automatic resource control."""
         self._start_resource_policy(fraction)
         self.resource_controller = None
+        self.constrained = False
 
     def _start_resource_policy(self, fraction: float):
         if self.policy_target is not None or self.auto_policy_epoch is not None:

@@ -3,12 +3,17 @@
 
 import time
 import traceback
-from contextlib import suppress
+from collections import deque
+from concurrent.futures import Future
+from contextlib import ExitStack, suppress
 from multiprocessing.connection import Connection
+from typing import Any
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
+from vllm.v1.rapidserve.parallel import ParallelWorker
 from vllm.v1.rapidserve.prefill import PrefillEngine
 from vllm.v1.rapidserve.worker import SharedModelWorker
 
@@ -16,15 +21,25 @@ from vllm.v1.rapidserve.worker import SharedModelWorker
 def run_prefill(config, connection: Connection) -> None:
     """Own shared allocations until the decode process closes its mappings."""
     executor = None
+    worker = None
     try:
         with set_current_vllm_config(config):
-            executor = UniProcExecutor(config)
-            worker = executor.driver_worker.worker
-            assert isinstance(worker, SharedModelWorker)
+            if config.parallel_config.world_size > 1:
+                executor = MultiprocExecutor(config)
+                worker = ParallelWorker(executor)
+            else:
+                executor = UniProcExecutor(config)
+                worker = executor.driver_worker.worker
+                assert isinstance(worker, SharedModelWorker)
             connection.send(("weights", worker.export_weights()))
             engine = None
             quiesce_epoch = None
+            policies: deque[tuple[int, Future[Any]]] = deque()
             while True:
+                if policies and policies[0][1].done():
+                    epoch, completion = policies.popleft()
+                    completion.result()
+                    connection.send(("policy_done", epoch))
                 if (
                     quiesce_epoch is not None
                     and engine is not None
@@ -60,9 +75,11 @@ def run_prefill(config, connection: Connection) -> None:
                     connection.send(("policy_done", worker.set_resource_policy(*args)))
                     continue
                 if method == "advance_policy":
-                    connection.send(
-                        ("policy_done", worker.advance_resource_policy(*args))
-                    )
+                    result = worker.advance_resource_policy(*args)
+                    if isinstance(result, Future):
+                        policies.append((args[0], result))
+                    else:
+                        connection.send(("policy_done", result))
                     continue
                 if method == "quiesce":
                     assert engine is not None
@@ -89,8 +106,11 @@ def run_prefill(config, connection: Connection) -> None:
                 if time.monotonic() >= deadline:
                     break
     finally:
-        if executor is not None:
-            executor.shutdown()
-        destroy_model_parallel()
-        destroy_distributed_environment()
-        connection.close()
+        with ExitStack() as cleanup:
+            cleanup.callback(connection.close)
+            cleanup.callback(destroy_distributed_environment)
+            cleanup.callback(destroy_model_parallel)
+            if isinstance(worker, ParallelWorker):
+                cleanup.callback(worker.close)
+            if executor is not None:
+                executor.shutdown()
