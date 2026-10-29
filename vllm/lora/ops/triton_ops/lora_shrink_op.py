@@ -12,6 +12,7 @@ from vllm import envs
 from vllm.lora.ops.triton_ops.kernel_utils import do_shrink_kernel
 from vllm.lora.ops.triton_ops.utils import (
     _get_lora_a_ptr,
+    get_lora_kernel_grid_dim,
     get_lora_op_configs,
     is_batch_invariant,
     supports_pdl,
@@ -332,7 +333,7 @@ def _lora_shrink(
     grid = (
         SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
         NUM_SLICES,
-        num_active_loras.item(),
+        get_lora_kernel_grid_dim(num_active_loras, lora_ids),
     )
 
     # PDL only works when dual-stream is being used.
