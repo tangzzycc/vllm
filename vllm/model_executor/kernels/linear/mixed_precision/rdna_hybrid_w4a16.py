@@ -317,6 +317,22 @@ _GFX1151_PREFILL_OVERRIDES: dict[
 }
 
 
+# Gemma-4-E4B asymmetric fp16, group_size=32. Small-prefill tiles are
+# (BLOCK_M, BLOCK_N, num_warps, num_stages); 129..256 rows use 64x64x32.
+# Measured on gfx1150 with cold weights at M=79, 139, and 140.
+_GFX1150_PREFILL_OVERRIDES: dict[tuple[int, int], tuple[int, int, int, int]] = {
+    (2560, 2048): (128, 64, 4, 1),
+    (2560, 3072): (128, 64, 4, 1),
+    (2560, 4096): (64, 64, 4, 2),
+    (2560, 6144): (64, 64, 4, 2),
+    (2560, 10752): (128, 64, 4, 1),
+    (2560, 20480): (128, 64, 4, 2),
+    (2048, 2560): (128, 64, 4, 1),
+    (4096, 2560): (128, 64, 4, 1),
+    (10240, 2560): (128, 32, 4, 2),
+}
+
+
 def _select_skinny_gfx1151_config(
     M: int,
     N: int,
@@ -481,6 +497,19 @@ def triton_w4a16_skinny_fmt_gemm(
         BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, packed_dequant = (
             _select_skinny_gfx1151_config(M, N, K, group_size, a.dtype, has_zp)
         )
+    elif (
+        _on_gfx115x()
+        and a.dtype == torch.float16
+        and has_zp
+        and group_size == 32
+        and 64 < M <= 256
+        and (K, N) in _GFX1150_PREFILL_OVERRIDES
+    ):
+        if M <= 128:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = _GFX1150_PREFILL_OVERRIDES[(K, N)]
+        else:
+            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
+        BLOCK_K = 32
     else:
         num_warps = 4
         if M <= 32:

@@ -3,9 +3,9 @@
 """Benchmark the RDNAHybridW4A16LinearKernel across decode and prefill shapes.
 
 Usage:
-    python benchmark_int4_gemm.py
-    python benchmark_int4_gemm.py --models Qwen/Qwen3-4B
-    python benchmark_int4_gemm.py --group-size 128
+    .venv/bin/python benchmarks/kernels/benchmark_rdna_hybrid_w4a16_gemm.py
+    .venv/bin/python benchmarks/kernels/benchmark_rdna_hybrid_w4a16_gemm.py \
+        --models google/gemma-4-E4B-it --group-size 32
 """
 
 import argparse
@@ -24,6 +24,17 @@ from vllm.triton_utils import triton
 # Weight shapes: [K, N], TP_SPLIT_DIM
 # ---------------------------------------------------------------------------
 WEIGHT_SHAPES = {
+    "google/gemma-4-E4B-it": [
+        ([2560, 2048], 1),  # shared-KV sliding q_proj
+        ([2560, 3072], 1),  # sliding qkv_proj
+        ([2560, 4096], 1),  # shared-KV full q_proj
+        ([2560, 6144], 1),  # full qkv_proj
+        ([2560, 10752], 1),  # per_layer_model_projection
+        ([2560, 20480], 1),  # gate_up_proj
+        ([2048, 2560], 0),  # sliding o_proj
+        ([4096, 2560], 0),  # full o_proj
+        ([10240, 2560], 0),  # down_proj
+    ],
     "Qwen/Qwen3-4B": [
         ([2560, 3840], 1),  # qkv_proj
         ([2560, 2560], 0),  # o_proj
@@ -94,7 +105,7 @@ PROVIDERS = ["torch-fp16", "hybrid-w4a16", "hybrid-w4a16-zp"]
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+        x_vals=[1, 2, 4, 8, 16, 32, 64, 79, 128, 139, 140, 256, 512, 1024, 2048, 4096],
         x_log=False,
         line_arg="provider",
         line_vals=PROVIDERS,

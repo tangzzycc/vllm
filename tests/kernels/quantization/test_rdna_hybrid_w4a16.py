@@ -320,6 +320,62 @@ def test_triton_prefill_gemm_matches_reference(dtype, has_zp, M, K, N, G):
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=5e-2)
 
 
+@pytest.mark.skipif(
+    not on_gfx115x() or hybrid_module._on_gfx1151(),
+    reason="prefill tiles are tuned for gfx1150",
+)
+@pytest.mark.parametrize("M", [65, 79, 128, 129, 139, 140, 256])
+@pytest.mark.parametrize(
+    "K,N",
+    [
+        (2560, 2048),
+        (2560, 3072),
+        (2560, 4096),
+        (2560, 6144),
+        (2560, 10752),
+        (2560, 20480),
+        (2048, 2560),
+        (4096, 2560),
+        (10240, 2560),
+    ],
+)
+def test_gfx1150_e4b_prefill_preserves_generic_output(M, K, N):
+    """Tuned short/mixed prefills preserve the generic kernel's exact output."""
+    from vllm.triton_utils import triton
+
+    set_random_seed(0)
+    G = 32
+    x, _, b_q, scales, _, zp = _make_prefill_case(M, K, N, G, torch.float16, True)
+    expected = torch.empty((M, N), device=device, dtype=x.dtype)
+    hybrid_module._triton_w4a16_skinny_fmt_kernel[
+        (triton.cdiv(M, 128), triton.cdiv(N, 128))
+    ](
+        x,
+        b_q,
+        scales,
+        zp,
+        expected,
+        M,
+        N,
+        K,
+        K // 8,
+        K // G,
+        scales.stride(0),
+        b_q.stride(0),
+        x.stride(0),
+        group_size=G,
+        ZP_BIAS=8,
+        HAS_ZP=True,
+        PACKED_DEQUANT=False,
+        BLOCK_M=128,
+        BLOCK_N=128,
+        BLOCK_K=32,
+        num_warps=4,
+    )
+    actual = triton_w4a16_skinny_fmt_gemm(x, b_q, scales, G, zp=zp)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 # ---------------------------------------------------------------------------
 # pack_int4_exllama_shuffle round-trips correctly
 # ---------------------------------------------------------------------------
