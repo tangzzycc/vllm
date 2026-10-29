@@ -176,6 +176,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr = 1,
 ):
     """Fused W4A16 GEMM reading weights from skinny format [N, K//8].
 
@@ -255,33 +256,62 @@ def _triton_w4a16_skinny_fmt_kernel(
             b = (b >> shifts_full) & 0xF
 
         group_idx = (k_start * BLOCK_K) // group_size
-        scale_ptrs = scales_ptr + offs_n * stride_sn + group_idx
-        scale_mask = offs_n < N
+        if GROUPS_PER_BLOCK > 1:
+            offs_g = group_idx + tl.arange(0, GROUPS_PER_BLOCK)
+            scale_ptrs = scales_ptr + offs_n[:, None] * stride_sn + offs_g[None, :]
+            scale_mask = (offs_n[:, None] < N) & (offs_g[None, :] < num_groups)
+        else:
+            scale_ptrs = scales_ptr + offs_n * stride_sn + group_idx
+            scale_mask = offs_n < N
         scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
 
         if HAS_ZP:
-            zp_ptrs = zp_ptr + (offs_n // 8) * stride_sn + group_idx
+            if GROUPS_PER_BLOCK > 1:
+                zp_ptrs = zp_ptr + (offs_n[:, None] // 8) * stride_sn + offs_g[None, :]
+                zp_shifts = 4 * (offs_n[:, None] % 8)
+            else:
+                zp_ptrs = zp_ptr + (offs_n // 8) * stride_sn + group_idx
+                zp_shifts = 4 * (offs_n % 8)
             zp_word = tl.load(zp_ptrs, mask=scale_mask, other=0)
-            zp_raw = (zp_word >> (4 * (offs_n % 8))) & 0xF
+            zp_raw = (zp_word >> zp_shifts) & 0xF
+
+        if GROUPS_PER_BLOCK > 1:
+            group_width: tl.constexpr = BLOCK_K // GROUPS_PER_BLOCK
+            scales = tl.reshape(
+                tl.broadcast_to(
+                    scales[:, :, None], (BLOCK_N, GROUPS_PER_BLOCK, group_width)
+                ),
+                (BLOCK_N, BLOCK_K),
+            )
+            if HAS_ZP:
+                zp_raw = tl.reshape(
+                    tl.broadcast_to(
+                        zp_raw[:, :, None], (BLOCK_N, GROUPS_PER_BLOCK, group_width)
+                    ),
+                    (BLOCK_N, BLOCK_K),
+                )
+        else:
+            scales = scales[:, None]
+            if HAS_ZP:
+                zp_raw = zp_raw[:, None]
 
         if PACKED_DEQUANT:
             # b_raw is 1024 + nibble, so subtract 1024 along with the zero point.
             c1024 = tl.full((), 1024.0, tl.float16)
             if HAS_ZP:
-                # 1024 + zp is one fp16 per row, not per element.
-                zp_off = (c1024 + zp_raw.to(tl.float16))[:, None]
+                zp_off = c1024 + zp_raw.to(tl.float16)
                 # b_raw - (1024 + zp) == nibble - zp exactly: every value is an
                 # integer below 2048, which fp16 represents exactly. Only the
                 # multiply by the scale rounds, as in the scalar path.
-                b_fp = (b_raw - zp_off) * scales[:, None]
+                b_fp = (b_raw - zp_off) * scales
             else:
                 # Same with the constant ZP_BIAS in place of the zero point.
-                b_fp = (b_raw - (c1024 + ZP_BIAS)) * scales[:, None]
+                b_fp = (b_raw - (c1024 + ZP_BIAS)) * scales
         else:
             if HAS_ZP:
-                b_fp = (b - zp_raw[:, None]).to(scales.dtype) * scales[:, None]
+                b_fp = (b - zp_raw).to(scales.dtype) * scales
             else:
-                b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None]
+                b_fp = (b - ZP_BIAS).to(scales.dtype) * scales
 
         b_fp_t = tl.trans(b_fp)
         accumulator += tl.dot(a, b_fp_t, out_dtype=tl.float32)
@@ -318,18 +348,21 @@ _GFX1151_PREFILL_OVERRIDES: dict[
 
 
 # Gemma-4-E4B asymmetric fp16, group_size=32. Small-prefill tiles are
-# (BLOCK_M, BLOCK_N, num_warps, num_stages); 129..256 rows use 64x64x32.
+# (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, packed_dequant).
+# Two quantization groups per K tile amortize the small group-size loop.
 # Measured on gfx1150 with cold weights at M=79, 139, and 140.
-_GFX1150_PREFILL_OVERRIDES: dict[tuple[int, int], tuple[int, int, int, int]] = {
-    (2560, 2048): (128, 64, 4, 1),
-    (2560, 3072): (128, 64, 4, 1),
-    (2560, 4096): (64, 64, 4, 2),
-    (2560, 6144): (64, 64, 4, 2),
-    (2560, 10752): (128, 64, 4, 1),
-    (2560, 20480): (128, 64, 4, 2),
-    (2048, 2560): (128, 64, 4, 1),
-    (4096, 2560): (128, 64, 4, 1),
-    (10240, 2560): (128, 32, 4, 2),
+_GFX1150_PREFILL_OVERRIDES: dict[
+    tuple[int, int], tuple[int, int, int, int, int, bool]
+] = {
+    (2560, 2048): (64, 128, 64, 4, 2, True),
+    (2560, 3072): (128, 32, 64, 4, 2, False),
+    (2560, 4096): (64, 128, 64, 4, 2, True),
+    (2560, 6144): (64, 128, 64, 4, 2, True),
+    (2560, 10752): (64, 128, 64, 4, 2, True),
+    (2560, 20480): (64, 128, 64, 4, 2, True),
+    (2048, 2560): (64, 64, 64, 4, 2, False),
+    (4096, 2560): (64, 64, 64, 4, 2, False),
+    (10240, 2560): (128, 32, 64, 4, 2, False),
 }
 
 
@@ -460,6 +493,7 @@ def triton_w4a16_skinny_fmt_gemm(
     # heuristics fall back to Triton's default pipeline depth.
     num_stages: int | None = None
     packed_dequant = False
+    groups_per_block = 1
     if _on_gfx12x():
         # Tuned on gfx1201 (Radeon AI PRO R9700, 32 CUs, 32-wide wavefronts)
         # using Llama-3.1-8B AWQ weight shapes with group_size=128.
@@ -506,10 +540,18 @@ def triton_w4a16_skinny_fmt_gemm(
         and (K, N) in _GFX1150_PREFILL_OVERRIDES
     ):
         if M <= 128:
-            BLOCK_M, BLOCK_N, num_warps, num_stages = _GFX1150_PREFILL_OVERRIDES[(K, N)]
+            (
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                num_warps,
+                num_stages,
+                packed_dequant,
+            ) = _GFX1150_PREFILL_OVERRIDES[(K, N)]
         else:
-            BLOCK_M, BLOCK_N, num_warps, num_stages = 64, 64, 4, 2
-        BLOCK_K = 32
+            BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = 64, 128, 64, 4, 2
+            packed_dequant = True
+        groups_per_block = BLOCK_K // group_size
     else:
         num_warps = 4
         if M <= 32:
@@ -519,10 +561,8 @@ def triton_w4a16_skinny_fmt_gemm(
         else:
             BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
 
-    # The kernel loads one scale per BLOCK_K tile, so BLOCK_K must not
-    # exceed group_size — otherwise elements in the tile that belong to
-    # a different group would get the wrong scale.
-    BLOCK_K = min(BLOCK_K, group_size)
+    if groups_per_block == 1:
+        BLOCK_K = min(BLOCK_K, group_size)
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
@@ -548,6 +588,7 @@ def triton_w4a16_skinny_fmt_gemm(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        GROUPS_PER_BLOCK=groups_per_block,
         num_warps=num_warps,
         **extra_kwargs,
     )

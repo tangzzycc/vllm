@@ -376,6 +376,51 @@ def test_gfx1150_e4b_prefill_preserves_generic_output(M, K, N):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
+@pytest.mark.parametrize(
+    "dtype,packed",
+    [(torch.float16, False), (torch.float16, True), (torch.bfloat16, False)],
+)
+@pytest.mark.parametrize("has_zp", [False, True])
+@pytest.mark.parametrize("K,G,BK", [(96, 32, 64), (192, 64, 128), (384, 128, 256)])
+def test_grouped_prefill_masks_partial_k_tile(dtype, packed, has_zp, K, G, BK):
+    """Each K tile uses both groups' metadata and masks its final partial tile."""
+    from vllm.triton_utils import triton
+
+    set_random_seed(0)
+    M, N = 17, 24
+    x, _, b_q, scales, _, zp = _make_prefill_case(M, K, N, G, dtype, has_zp)
+    expected = triton_w4a16_skinny_fmt_gemm(x, b_q, scales, G, zp=zp)
+    actual = torch.empty_like(expected)
+    hybrid_module._triton_w4a16_skinny_fmt_kernel[
+        (triton.cdiv(M, 32), triton.cdiv(N, 32))
+    ](
+        x,
+        b_q,
+        scales,
+        zp if has_zp else scales,
+        actual,
+        M,
+        N,
+        K,
+        K // 8,
+        K // G,
+        scales.stride(0),
+        b_q.stride(0),
+        x.stride(0),
+        group_size=G,
+        ZP_BIAS=8,
+        HAS_ZP=has_zp,
+        PACKED_DEQUANT=packed,
+        BLOCK_M=32,
+        BLOCK_N=32,
+        BLOCK_K=BK,
+        GROUPS_PER_BLOCK=BK // G,
+        num_warps=4,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 # ---------------------------------------------------------------------------
 # pack_int4_exllama_shuffle round-trips correctly
 # ---------------------------------------------------------------------------

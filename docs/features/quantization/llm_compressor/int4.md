@@ -10,8 +10,10 @@ Please visit the HF collection of [quantized INT4 checkpoints of popular LLMs re
 On ROCm RDNA GPUs, supported W4A16 layers use the hybrid HIP decode and
 Triton prefill kernels. Gemma-4-E4B asymmetric INT4 weights with group size 32
 and FP16 activations use tuned prefill tiles on gfx1150 for 65–256 activation
-rows, including batches that mix a prefill with an ongoing decode. This path
-retains packed INT4 weights and does not allocate a dense FP16 weight copy.
+rows, including batches that mix a prefill with an ongoing decode. The tiles
+process two quantization groups per K step and apply each group's scale and
+zero point separately. This path retains packed INT4 weights and does not
+allocate a dense FP16 weight copy.
 
 ## Prerequisites
 
