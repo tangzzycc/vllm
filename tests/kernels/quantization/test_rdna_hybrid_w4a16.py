@@ -300,6 +300,8 @@ def _make_prefill_case(M, K, N, G, dtype, has_zp):
         (160, 256, 1024, 64),
         (256, 512, 512, 128),
         (257, 512, 512, 128),
+        (79, 2560, 2048, 32),
+        (139, 2560, 2048, 32),
     ],
 )
 def test_triton_prefill_gemm_matches_reference(dtype, zp_mode, M, K, N, G):
@@ -366,6 +368,7 @@ def test_gfx1150_e4b_prefill_preserves_generic_output(M, K, N):
         b_q,
         scales,
         zp,
+        scales,  # unused carrier pointer
         expected,
         M,
         N,
@@ -379,6 +382,7 @@ def test_gfx1150_e4b_prefill_preserves_generic_output(M, K, N):
         ZP_BIAS=8,
         HAS_ZP=True,
         PACKED_DEQUANT=False,
+        HAS_SCALE_ZP_CARRIER=False,
         BLOCK_M=128,
         BLOCK_N=128,
         BLOCK_K=32,
@@ -411,6 +415,7 @@ def test_grouped_prefill_masks_partial_k_tile(dtype, packed, has_zp, K, G, BK):
         b_q,
         scales,
         zp if has_zp else scales,
+        scales,  # unused carrier pointer
         actual,
         M,
         N,
@@ -424,6 +429,7 @@ def test_grouped_prefill_masks_partial_k_tile(dtype, packed, has_zp, K, G, BK):
         ZP_BIAS=8,
         HAS_ZP=has_zp,
         PACKED_DEQUANT=packed,
+        HAS_SCALE_ZP_CARRIER=False,
         BLOCK_M=32,
         BLOCK_N=32,
         BLOCK_K=BK,

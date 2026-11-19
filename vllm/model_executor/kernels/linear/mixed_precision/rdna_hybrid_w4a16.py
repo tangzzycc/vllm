@@ -248,9 +248,16 @@ def _triton_w4a16_skinny_fmt_kernel(
             scale_mask = offs_n < N
 
         if HAS_SCALE_ZP_CARRIER:
-            # Carrier selection uses one quantization group per K tile.
+            if GROUPS_PER_BLOCK > 1:
+                carrier_ptrs = (
+                    scale_zp_carrier_ptr
+                    + offs_n[:, None] * num_groups
+                    + offs_g[None, :]
+                )
+            else:
+                carrier_ptrs = scale_zp_carrier_ptr + offs_n * num_groups + group_idx
             scale_zp_carrier = tl.load(
-                scale_zp_carrier_ptr + offs_n * num_groups + group_idx,
+                carrier_ptrs,
                 mask=scale_mask,
                 other=0,
             )
@@ -263,7 +270,9 @@ def _triton_w4a16_skinny_fmt_kernel(
             scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
             if HAS_ZP:
                 if GROUPS_PER_BLOCK > 1:
-                    zp_ptrs = zp_ptr + (offs_n[:, None] // 8) * stride_sn + offs_g[None, :]
+                    zp_ptrs = (
+                        zp_ptr + (offs_n[:, None] // 8) * stride_sn + offs_g[None, :]
+                    )
                     zp_shifts = 4 * (offs_n[:, None] % 8)
                 else:
                     zp_ptrs = zp_ptr + (offs_n // 8) * stride_sn + group_idx
@@ -279,7 +288,14 @@ def _triton_w4a16_skinny_fmt_kernel(
                 ),
                 (BLOCK_N, BLOCK_K),
             )
-            if HAS_ZP:
+            if HAS_SCALE_ZP_CARRIER:
+                bias_eff = tl.reshape(
+                    tl.broadcast_to(
+                        bias_eff[:, :, None], (BLOCK_N, GROUPS_PER_BLOCK, group_width)
+                    ),
+                    (BLOCK_N, BLOCK_K),
+                )
+            elif HAS_ZP:
                 zp_raw = tl.reshape(
                     tl.broadcast_to(
                         zp_raw[:, :, None], (BLOCK_N, GROUPS_PER_BLOCK, group_width)
