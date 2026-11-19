@@ -39,9 +39,10 @@ constexpr int64_t kNumDecodeConfigs = std::size(rdna::kDecodeConfigs);
 constexpr int64_t kNumDecodeBatchConfigs = std::size(rdna::kDecodeBatchConfigs);
 constexpr int64_t kNumPrefillConfigs = std::size(rdna::kPrefillConfigs);
 
-bool on_gfx1151() {
+bool on_rdna_attn_gpu() {
   const std::string arch = at::cuda::getCurrentDeviceProperties()->gcnArchName;
-  return arch.find("gfx1151") != std::string::npos;
+  return arch.find("gfx1150") != std::string::npos ||
+         arch.find("gfx1151") != std::string::npos;
 }
 
 // The kernels expect (num_pages, NUM_KV_HEADS, PAGE_SIZE, 2 * HEAD_DIM).
@@ -68,12 +69,12 @@ void check_device(const torch::Tensor& q,
 }  // namespace
 
 // Every build of a decode table, its DecodeConfig fields in order; none off
-// gfx1151. Raises if a build has no instantiation unit.
+// gfx1150/gfx1151. Raises if a build has no instantiation unit.
 std::vector<int64_t> decode_configs(const rdna::DecodeConfig* configs,
                                     int64_t n, rdna::LaunchFn* launchers,
                                     const char* kernel) {
   std::vector<int64_t> fields;
-  if (!on_gfx1151()) return fields;
+  if (!on_rdna_attn_gpu()) return fields;
   for (int64_t i = 0; i < n; ++i) {
     const rdna::DecodeConfig& c = configs[i];
     TORCH_CHECK(launchers[i], kernel, " build ", i, " (head dim ",
@@ -100,11 +101,11 @@ std::vector<int64_t> rdna_decode_batch_configs() {
                         rdna::decode_batch_launchers(), "batched decode");
 }
 
-// Every prefill build, its PrefillConfig fields in order; none off gfx1151.
-// Raises if a build has no instantiation unit.
+// Every prefill build, its PrefillConfig fields in order; none off
+// gfx1150/gfx1151. Raises if a build has no instantiation unit.
 std::vector<int64_t> rdna_prefill_configs() {
   std::vector<int64_t> fields;
-  if (!on_gfx1151()) return fields;
+  if (!on_rdna_attn_gpu()) return fields;
   for (int64_t i = 0; i < kNumPrefillConfigs; ++i) {
     const rdna::PrefillConfig& c = rdna::kPrefillConfigs[i];
     TORCH_CHECK(rdna::prefill_launchers()[i], "prefill build ", i,
@@ -121,12 +122,12 @@ std::vector<int64_t> rdna_prefill_configs() {
   return fields;
 }
 
-// Every prefill batch cell, its fields in order; none off gfx1151. Raises if
-// a cell names no prefill build.
+// Every prefill batch cell, its fields in order; none off gfx1150/gfx1151.
+// Raises if a cell names no prefill build.
 std::vector<int64_t> rdna_prefill_batch_configs() {
   using namespace rdna;
   std::vector<int64_t> fields;
-  if (!on_gfx1151()) return fields;
+  if (!on_rdna_attn_gpu()) return fields;
   for (const PrefillBatchConfig& b : kPrefillBatchConfigs) {
     for (Dtype dtype : {Dtype::kFp16, Dtype::kBf16}) {
       const bool built = std::any_of(
