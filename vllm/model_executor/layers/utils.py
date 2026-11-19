@@ -452,6 +452,9 @@ def lmhead_skinny_guard_permits(weight: torch.Tensor, n: int) -> bool:
     pathology on large weights, and its fall-through would be a numerics
     change with no speed win, so single-row calls stay on the stock path.
 
+    The two-row FP16 E4B lm_head on gfx1150 also keeps wvSplitK under
+    the automatic cap. Explicit positive caps still take precedence.
+
     Returns True (keep wvSplitK) when n <= 1 or the weight is under the
     cap; otherwise returns False after emitting a census WARNING (once per
     (shape, n) per process) naming the redirected site.
@@ -461,6 +464,18 @@ def lmhead_skinny_guard_permits(weight: torch.Tensor, n: int) -> bool:
     max_bytes = _skinny_gemm_max_weight_bytes()
     if weight.nbytes <= max_bytes:
         return True
+    if (
+        n == 2
+        and weight.shape == (262144, 2560)
+        and weight.dtype == torch.float16
+        and weight.is_cuda
+        and current_platform.is_rocm()
+        and envs.VLLM_SKINNY_GEMM_MAX_WEIGHT_BYTES == 0
+    ):
+        from vllm.platforms.rocm import on_gfx1150
+
+        if on_gfx1150():
+            return True
     key = (tuple(weight.shape), n)
     if key not in _skinny_guard_warned:
         _skinny_guard_warned.add(key)

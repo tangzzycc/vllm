@@ -15,6 +15,13 @@ process two quantization groups per K step and apply each group's scale and
 zero point separately. This path retains packed INT4 weights and does not
 allocate a dense FP16 weight copy.
 
+For the FP16 E4B `lm_head` with shape `(262144, 2560)`, gfx1150 uses the
+skinny GEMM path at two activation rows, including concurrent decoding with
+two LoRA adapters. This selection applies when
+`VLLM_SKINNY_GEMM_MAX_WEIGHT_BYTES` is unset or `0`; an explicit positive
+cap retains the configured size limit. Other batch sizes and weight shapes
+keep their existing dispatch.
+
 ## Prerequisites
 
 To use INT4 quantization with vLLM, you'll need to install the [llm-compressor](https://github.com/vllm-project/llm-compressor/) library:

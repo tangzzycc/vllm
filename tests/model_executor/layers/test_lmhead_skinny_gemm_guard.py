@@ -264,3 +264,37 @@ def test_n1_big_weight_dispatch_unchanged(monkeypatch):
     x = _x(1, BIG_SHAPE[1])
     skinny, _ = _skinny_dispatch(monkeypatch, x, w)
     assert skinny, "n=1 was redirected by the guard; the carve-out is missing"
+
+
+def test_e4b_two_row_dispatch_and_explicit_cap_preserve_outputs():
+    """Validate E4B dispatch through real GEMMs, including cap overrides."""
+    torch.manual_seed(0)
+    shape = (262144, 2560)
+    weight = torch.empty(shape, device="cuda", dtype=torch.float16).uniform_(
+        -0.01, 0.01
+    )
+    arch = torch.cuda.get_device_properties().gcnArchName.split(":")[0]
+    for cap, expected in (
+        (None, arch == "gfx1150"),
+        (0, arch == "gfx1150"),
+        (256 * 1024 * 1024, False),
+        (weight.nbytes, True),
+    ):
+        _set_cap(cap)
+        x = torch.empty((2, shape[1]), device="cuda", dtype=torch.float16).uniform_(
+            -0.1, 0.1
+        )
+        reference = torch.nn.functional.linear(x, weight)
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as profile:
+            output = rocm_unquantized_gemm_impl(x, weight)
+        names = {event.key for event in profile.key_averages()}
+        assert ("_rocm_C::wvSplitK" in names) == expected
+        torch.testing.assert_close(output, reference, rtol=1e-3, atol=1e-4)
+
+    _set_cap(None)
+    for rows in (3, 4, 5):
+        assert not lmhead_skinny_guard_permits(weight, rows)
+    assert not lmhead_skinny_guard_permits(weight.view(torch.bfloat16), 2)
+    assert not lmhead_skinny_guard_permits(weight[:-1], 2)
